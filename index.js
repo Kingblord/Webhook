@@ -5,11 +5,57 @@ const axios = require("axios");
 dotenv.config();
 
 const app = express();
-
 app.use(express.json());
 
 const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
 const GATEWAY_URL = process.env.GATEWAY_URL || "http://localhost:3001";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+
+if (!OPENROUTER_API_KEY) {
+  console.warn("⚠️  OPENROUTER_API_KEY is not set in .env file");
+}
+
+// ========================
+// AI RESPONSE USING OPENROUTER
+// ========================
+
+async function getAIResponse(userMessage) {
+  try {
+    const response = await axios.post(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        model: "openrouter/free",        // ← You can change model
+        // model: "anthropic/claude-3.5-sonnet",     // Alternative good option
+        messages: [
+          {
+            role: "system",
+            content: "You are a helpful, friendly, and engaging assistant."
+          },
+          {
+            role: "user",
+            content: userMessage
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 500,
+      },
+      {
+        headers: {
+          "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+          "HTTP-Referer": "https://aromsg.up.railway.app", // Optional but recommended
+          "X-Title": "AroMsg WhatsApp Gateway",
+        },
+        timeout: 15000,
+      }
+    );
+
+    return response.data.choices[0]?.message?.content?.trim() || 
+           "Sorry, I couldn't generate a response right now.";
+  } catch (error) {
+    console.error("❌ OpenRouter API Error:", error.response?.data || error.message);
+    return "Sorry, I'm having trouble thinking right now. Please try again later.";
+  }
+}
 
 // ========================
 // WEBHOOK ENDPOINT
@@ -24,35 +70,23 @@ app.post("/webhook", async (req, res) => {
 
     if (!authHeader || authHeader !== `Bearer ${INTERNAL_API_KEY}`) {
       console.log("❌ Unauthorized webhook attempt");
-      return res.status(401).json({
-        success: false,
-        error: "Unauthorized"
-      });
+      return res.status(401).json({ success: false, error: "Unauthorized" });
     }
 
-    const {
-      userId,
-      from,
-      text,
-      platform,
-      messageId,
-      timestamp
-    } = req.body;
+    const { userId, from, text, platform, messageId, timestamp } = req.body;
 
     console.log("📨 WEBHOOK RECEIVED:");
     console.log(JSON.stringify(req.body, null, 2));
 
     if (!userId || !from || !text) {
-      return res.status(400).json({
-        success: false,
-        error: "Missing required fields"
-      });
+      return res.status(400).json({ success: false, error: "Missing required fields" });
     }
 
     // ========================
-    // AI RESPONSE (Fake for now)
+    // GET AI RESPONSE FROM OPENROUTER
     // ========================
-    const aiReply = `Echo: ${text}\n\nThis is a test reply from the backend! 👋`;
+    console.log("🤖 Generating AI reply...");
+    const aiReply = await getAIResponse(text);
 
     console.log("🤖 AI Reply:", aiReply);
 
@@ -108,6 +142,6 @@ app.get("/health", (_, res) => {
 const PORT = Number(process.env.PORT) || 3000;
 
 app.listen(PORT, () => {
-  console.log(`🚀 Test Webhook Server running on port ${PORT}`);
+  console.log(`🚀 Webhook Server running on port ${PORT}`);
   console.log(`📡 Gateway URL: ${GATEWAY_URL}`);
 });
