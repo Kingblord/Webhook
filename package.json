@@ -1,13 +1,28 @@
 {
-  "name": "webhook-test",
+  "name": "aromsg-ai-webhook-service",
   "version": "1.0.0",
+  "description": "Standalone AI webhook service for WhatsApp with Firestore integration",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
+  "keywords": [
+    "whatsapp",
+    "ai",
+    "webhook",
+    "openrouter",
+    "firebase"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.7.2",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.3.1",
+    "axios": "^1.6.2",
+    "firebase-admin": "^12.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   }
 }
