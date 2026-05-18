@@ -3,6 +3,9 @@ const dotenv = require('dotenv')
 const axios = require('axios')
 const admin = require('firebase-admin')
 
+// Official Baileys JID Normalizer
+const { jidNormalizedUser } = require("@whiskeysockets/baileys")
+
 dotenv.config()
 
 const app = express()
@@ -50,6 +53,14 @@ try {
 }
 
 // ========================
+// OFFICIAL BAILEYS JID NORMALIZER
+// ========================
+function normalizeJid(jid) {
+  if (!jid) return jid;
+  return jidNormalizedUser(jid);
+}
+
+// ========================
 // AI RESPONSE USING OPENROUTER
 // ========================
 
@@ -61,14 +72,8 @@ async function getAIResponse(userMessage, systemPrompt) {
       {
         model: OPENROUTER_MODEL,
         messages: [
-          {
-            role: 'system',
-            content: systemPrompt,
-          },
-          {
-            role: 'user',
-            content: userMessage,
-          },
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userMessage },
         ],
         temperature: 0.7,
         max_tokens: 500,
@@ -100,7 +105,6 @@ async function findBusinessForCustomer(phoneNumber) {
   try {
     console.log(`[DB] 🔍 Finding business for customer: ${phoneNumber}`)
 
-    // Query contacts collection across all businesses
     const contactsSnapshot = await db
       .collectionGroup('contacts')
       .where('phone', '==', phoneNumber.replace(/\D/g, ''))
@@ -125,14 +129,13 @@ async function findBusinessForCustomer(phoneNumber) {
 }
 
 // ========================
-// GET BUSINESS CONFIG & PRODUCTS
+// GET BUSINESS CONTEXT & PRODUCTS
 // ========================
 
 async function getBusinessContext(businessId) {
   try {
     console.log(`[DB] 📦 Loading business config for: ${businessId}`)
 
-    // Get business doc
     const businessDoc = await db.collection('businesses').doc(businessId).get()
     if (!businessDoc.exists) {
       console.log(`[DB] ❌ Business not found: ${businessId}`)
@@ -142,7 +145,6 @@ async function getBusinessContext(businessId) {
     const businessData = businessDoc.data()
     console.log(`[DB] ✅ Business loaded: ${businessData.name}`)
 
-    // Get products
     let productsContext = ''
     try {
       const productsSnapshot = await db
@@ -157,9 +159,7 @@ async function getBusinessContext(businessId) {
         const productsList = productsSnapshot.docs
           .map((doc) => {
             const product = doc.data()
-            return `- ${product.name} ($${product.price}${
-              product.negotiationEnabled ? ', negotiable' : ''
-            }): ${product.description}`
+            return `- ${product.name} ($${product.price}${product.negotiationEnabled ? ', negotiable' : ''}): ${product.description}`
           })
           .join('\n')
 
@@ -217,20 +217,21 @@ async function saveMessage(businessId, phoneNumber, role, text, messageId) {
 }
 
 // ========================
-// SEND REPLY VIA GATEWAY
+// SEND REPLY VIA GATEWAY (Updated with Official Normalizer)
 // ========================
 
 async function sendReplyViaGateway(userId, phoneNumber, replyText) {
   try {
     console.log(`[GATEWAY] 📤 Sending reply to ${phoneNumber}`)
 
-    const normalizedPhone = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`
+    // Use Official Baileys Normalizer
+    const normalizedJid = normalizeJid(phoneNumber);
 
     const response = await axios.post(
       `${GATEWAY_URL}/send-message`,
       {
         userId,
-        to: normalizedPhone,
+        to: normalizedJid,           // ← Now using official normalized JID
         text: replyText,
       },
       {
@@ -242,7 +243,7 @@ async function sendReplyViaGateway(userId, phoneNumber, replyText) {
       }
     )
 
-    console.log(`[GATEWAY] ✅ Reply queued successfully`)
+    console.log(`[GATEWAY] ✅ Reply queued successfully to ${normalizedJid}`)
     return true
   } catch (err) {
     console.error('[GATEWAY] ❌ Failed to send reply:', err.message)
@@ -256,9 +257,6 @@ async function sendReplyViaGateway(userId, phoneNumber, replyText) {
 
 app.post('/webhook', async (req, res) => {
   try {
-    // ========================
-    // AUTHENTICATION
-    // ========================
     const authHeader = req.headers.authorization
 
     if (!authHeader || authHeader !== `Bearer ${INTERNAL_API_KEY}`) {
@@ -273,15 +271,16 @@ app.post('/webhook', async (req, res) => {
     console.log('='.repeat(60))
     console.log('[WEBHOOK] Payload:', JSON.stringify(req.body, null, 2))
 
-    // ========================
-    // VALIDATE PAYLOAD
-    // ========================
     if (!userId || !from || !text) {
       console.log('[WEBHOOK] ❌ Missing required fields')
       return res.status(400).json({ success: false, error: 'Missing required fields' })
     }
 
-    const phoneNumber = from.replace('@s.whatsapp.net', '').replace('@lid', '')
+    // Use official normalizer
+    const normalizedFrom = normalizeJid(from);
+    const phoneNumber = normalizedFrom.replace('@s.whatsapp.net', '');
+
+    console.log(`[WEBHOOK] 📍 Normalized JID: ${normalizedFrom}`);
 
     // ========================
     // SAVE INCOMING MESSAGE
@@ -291,14 +290,11 @@ app.post('/webhook', async (req, res) => {
     await saveMessage(userId, phoneNumber, 'user', text, incomingMessageId)
 
     // ========================
-    // FIND BUSINESS FOR CUSTOMER (Optional - for future use)
+    // BUSINESS CONTEXT
     // ========================
     let businessId = userId
     console.log(`[WEBHOOK] 📍 Using businessId: ${businessId}`)
 
-    // ========================
-    // GET BUSINESS CONTEXT
-    // ========================
     console.log('[WEBHOOK] 📦 Loading business context...')
     const context = await getBusinessContext(businessId)
 
@@ -314,7 +310,7 @@ app.post('/webhook', async (req, res) => {
 
     const systemPrompt =
       `You are an AI sales assistant for ${context.businessName}.\n\n` +
-      `${personality}${context.productsContext}\n\n` +
+      `\( {personality} \){context.productsContext}\n\n` +
       `Keep replies concise (1-3 sentences). Never make up product information. ` +
       `If a customer asks about negotiation on a product, check if negotiation is available. ` +
       `Never reveal you are an AI unless directly asked.`
@@ -338,11 +334,8 @@ app.post('/webhook', async (req, res) => {
     // SEND REPLY VIA GATEWAY
     // ========================
     console.log('[WEBHOOK] 📤 Sending reply via gateway...')
-    await sendReplyViaGateway(businessId, phoneNumber, aiReply)
+    await sendReplyViaGateway(businessId, normalizedFrom, aiReply)   // ← Using normalized JID
 
-    // ========================
-    // RESPOND TO GATEWAY
-    // ========================
     console.log('[WEBHOOK] ✅ Webhook complete')
     console.log('='.repeat(60) + '\n')
 
@@ -366,6 +359,7 @@ app.post('/webhook', async (req, res) => {
 // ========================
 
 app.get('/health', async (req, res) => {
+  // ... (your existing health check logic - unchanged)
   try {
     const health = {
       status: 'healthy',
@@ -378,35 +372,27 @@ app.get('/health', async (req, res) => {
       },
     }
 
-    // Test gateway connectivity
     try {
-      const gatewayRes = await axios.get(`${GATEWAY_URL}/status/health`, {
-        timeout: 5000,
-      })
+      const gatewayRes = await axios.get(`${GATEWAY_URL}/health`, { timeout: 5000 })
       health.checks.gateway = gatewayRes.status === 200
     } catch (err) {
       health.checks.gateway = false
     }
 
-    const allHealthy = Object.values(health.checks).every((v) => v)
+    const allHealthy = Object.values(health.checks).every((v) => v === true)
     health.status = allHealthy ? 'healthy' : 'degraded'
 
     console.log('[HEALTH] Status:', health.status)
     res.status(allHealthy ? 200 : 503).json(health)
   } catch (err) {
     console.error('[HEALTH] Error:', err.message)
-    res.status(500).json({
-      status: 'unhealthy',
-      error: err.message,
-    })
+    res.status(500).json({ status: 'unhealthy', error: err.message })
   }
 })
 
 // ========================
 // START SERVER
 // ========================
-
-
 
 app.listen(PORT, () => {
   console.log('\n' + '='.repeat(60))
