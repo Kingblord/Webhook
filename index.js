@@ -300,6 +300,10 @@ async function sendReplyViaGateway(userId, jid, replyText) {
 // MAIN WEBHOOK
 // ========================
 app.post('/webhook', async (req, res) => {
+// ========================
+// MAIN WEBHOOK (Updated with Currency & AI Loop)
+// ========================
+app.post('/webhook', async (req, res) => {
   try {
     const authHeader = req.headers.authorization
     if (!authHeader || authHeader !== `Bearer ${INTERNAL_API_KEY}`) {
@@ -323,6 +327,12 @@ app.post('/webhook', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Business not found' })
     }
 
+    // 1. Fetch User Profile Currency Settings (Defaults to NGN/Naira if not explicitly set)
+    // Assuming context raw object holds the full business document data
+    const businessDoc = await db.collection('businesses').doc(userId).get()
+    const businessData = businessDoc.data() || {}
+    const userCurrency = businessData.currency || 'NGN' 
+
     const aiResult = await getAIResponse(
       context.businessName,
       context.aiPersonality,
@@ -331,13 +341,68 @@ app.post('/webhook', async (req, res) => {
       text
     )
 
-    let replyText = aiResult.content
+    let replyText;
 
     if (aiResult.type === "tool_call") {
+      // 2. Run the local functional tool layer
       const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products)
-      replyText = toolResult
+      
+      console.log(`[AI-BRAIN] Re-routing tool data to AI for natural language synthesis...`)
+      
+      // 3. Feed tool data back into OpenRouter to build a human response mapping the preferred currency
+      try {
+        const secondarySystemPrompt = `You are a smooth, persuasive AI Sales Assistant for ${context.businessName}.
+        
+        Here is the real-time execution response from the database regarding their request:
+        """
+        ${toolResult}
+        """
+        
+        CRITICAL OPERATIONAL DIRECTIVES:
+        1. Answer the customer's request conversationally using the data values listed above.
+        2. Format all prices matching the profile's preferred currency system: "${userCurrency}". (e.g., If NGN use ₦, if USD use $, etc.)
+        3. If the item status shows it is negotiable, handle it gracefully like a master human negotiator. Ask for their target price range or extend a polite opening offer to secure the order.
+        4. Do NOT output raw variable templates, code blocks, or JavaScript structural braces to the customer.
+        5. Keep your response concise, friendly, and structured perfectly for a short WhatsApp chat message.`
+
+        const refinedResponse = await axios.post(
+          'https://openrouter.ai/api/v1/chat/completions',
+          {
+            model: OPENROUTER_MODEL,
+            messages: [
+              { role: 'system', content: secondarySystemPrompt },
+              ...history.slice(-6).map(m => ({
+                role: m.role === 'user' ? 'user' : 'assistant',
+                content: m.text
+              })),
+              { role: 'user', content: text }
+            ],
+            temperature: 0.7,
+            max_tokens: 450,
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+              'HTTP-Referer': 'https://aromsg.up.railway.app',
+              'X-Title': 'AroMsg WhatsApp AI',
+            },
+            timeout: 20000,
+          }
+        )
+
+        replyText = refinedResponse.data.choices[0].message.content?.trim() || "Let me process that right layout for you.";
+
+      } catch (refineError) {
+        console.error('[AI Tool Refinement Loop Error]:', refineError.message)
+        replyText = toolResult // Fallback safety measure
+      }
+
+    } else {
+      // Direct text conversation loop
+      replyText = aiResult.content
     }
 
+    // 4. Persistence and Gateway pipeline
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
 
