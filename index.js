@@ -96,11 +96,10 @@ async function getBusinessContext(businessId) {
     let productsContext = ''
     if (products.length > 0) {
       productsContext = '\n\nAvailable Products:\n' + 
-  products.map(p => {
-    const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
-    return `- ${p.name} (${p.price})${negotiable}: ${p.description || ''}`;
-  }).join('\n');
-
+        products.map(p => {
+          const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
+          return `- ${p.name} (${p.price})${negotiable}: ${p.description || ''}`;
+        }).join('\n');
     }
 
     return {
@@ -129,9 +128,6 @@ const tools = [
 
 // ========================
 // TOOL EXECUTION LAYER
-// ========================
-// ========================
-// TOOL EXECUTION LAYER (FIXED)
 // ========================
 async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   const { name, arguments: argsStr } = toolCall.function
@@ -183,13 +179,10 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   }
 }
 
-
 // ========================
-// AI DECISION BRAIN (Improved Reasoning)
+// AI DECISION BRAIN
 // ========================
- async function getAIResponse(businessName, personality, productsContext, history, userMessage) {
-  // We feed the database context directly into the system prompt so the LLM 
-  // knows exactly what products exist, their prices, and if they are negotiable.
+async function getAIResponse(businessName, personality, productsContext, history, userMessage) {
   const systemPrompt = `You are a smart AI Sales Assistant for ${businessName}.
 
 ${personality || 'You are friendly, professional, and focused on helping customers.'}
@@ -237,7 +230,6 @@ ${productsContext || 'No product data available.'}
 
     const message = response.data.choices[0].message
 
-    // Check if the AI decided to invoke a tool
     if (message.tool_calls?.length > 0) {
       console.log(`[AI] 🛠️ Tool Called: ${message.tool_calls[0].function.name}`)
       return {
@@ -247,7 +239,6 @@ ${productsContext || 'No product data available.'}
       }
     }
 
-    // If the LLM responds directly with text, return it cleanly
     return {
       type: "text",
       content: message.content?.trim() || "I'm here to help! What would you like to know?"
@@ -259,9 +250,8 @@ ${productsContext || 'No product data available.'}
   }
 }
 
-
 // ========================
-// SAVE MESSAGE + SEND REPLY (Unchanged)
+// SAVE MESSAGE + SEND REPLY
 // ========================
 async function saveMessage(businessId, phoneNumber, role, text, messageId) {
   try {
@@ -309,10 +299,6 @@ async function sendReplyViaGateway(userId, jid, replyText) {
 // MAIN WEBHOOK
 // ========================
 app.post('/webhook', async (req, res) => {
-// ========================
-// MAIN WEBHOOK (Updated with Currency & AI Loop)
-// ========================
-app.post('/webhook', async (req, res) => {
   try {
     const authHeader = req.headers.authorization
     if (!authHeader || authHeader !== `Bearer ${INTERNAL_API_KEY}`) {
@@ -336,8 +322,7 @@ app.post('/webhook', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Business not found' })
     }
 
-    // 1. Fetch User Profile Currency Settings (Defaults to NGN/Naira if not explicitly set)
-    // Assuming context raw object holds the full business document data
+    // Fetch User Profile Currency Settings (Defaults to NGN if field is unpopulated)
     const businessDoc = await db.collection('businesses').doc(userId).get()
     const businessData = businessDoc.data() || {}
     const userCurrency = businessData.currency || 'NGN' 
@@ -353,12 +338,10 @@ app.post('/webhook', async (req, res) => {
     let replyText;
 
     if (aiResult.type === "tool_call") {
-      // 2. Run the local functional tool layer
       const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products)
       
       console.log(`[AI-BRAIN] Re-routing tool data to AI for natural language synthesis...`)
       
-      // 3. Feed tool data back into OpenRouter to build a human response mapping the preferred currency
       try {
         const secondarySystemPrompt = `You are a smooth, persuasive AI Sales Assistant for ${context.businessName}.
         
@@ -399,19 +382,17 @@ app.post('/webhook', async (req, res) => {
           }
         )
 
-        replyText = refinedResponse.data.choices[0].message.content?.trim() || "Let me process that right layout for you.";
+        replyText = refinedResponse.data.choices[0].message.content?.trim() || "Let me process that information for you.";
 
       } catch (refineError) {
         console.error('[AI Tool Refinement Loop Error]:', refineError.message)
-        replyText = toolResult // Fallback safety measure
+        replyText = toolResult 
       }
 
     } else {
-      // Direct text conversation loop
       replyText = aiResult.content
     }
 
-    // 4. Persistence and Gateway pipeline
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
 
