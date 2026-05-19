@@ -96,9 +96,11 @@ async function getBusinessContext(businessId) {
     let productsContext = ''
     if (products.length > 0) {
       productsContext = '\n\nAvailable Products:\n' + 
-        products.map(p => 
-          `- \( {p.name} (\[ {p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}: ${p.description || ''}`
-        ).join('\n')
+  products.map(p => {
+    const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
+    return `- ${p.name} (${p.price})${negotiable}: ${p.description || ''}`;
+  }).join('\n');
+
     }
 
     return {
@@ -135,11 +137,17 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   console.log(`[TOOL] Executing ${name} with args:`, args)
 
   switch (name) {
-    case "getProductList":
-      if (products.length === 0) return "We currently have no products listed."
-      return `Here are our products:\n` +
-        products.map(p => `- \( {p.name} ( \]{p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}`).join('\n') +
-        `\n\nWhich one are you interested in?`
+    // Replace your existing getProductList case with this:
+case "getProductList":
+  if (products.length === 0) return "We currently have no products listed."
+  
+  return `Here are our products:\n` +
+    products.map(p => {
+      const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
+      return `• ${p.name} (${p.price})${negotiable}`;
+    }).join('\n') +
+    `\n\nWhich one are you interested in?`;
+
 
     case "getProductInfo":
       const product = products.find(p => 
