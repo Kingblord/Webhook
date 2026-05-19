@@ -175,18 +175,25 @@ case "getProductList":
 // ========================
 // AI DECISION BRAIN (Improved Reasoning)
 // ========================
-async function getAIResponse(businessName, personality, productsContext, history, userMessage) {
+ async function getAIResponse(businessName, personality, productsContext, history, userMessage) {
+  // We feed the database context directly into the system prompt so the LLM 
+  // knows exactly what products exist, their prices, and if they are negotiable.
   const systemPrompt = `You are a smart AI Sales Assistant for ${businessName}.
 
 ${personality || 'You are friendly, professional, and focused on helping customers.'}
 
+Current Business Inventory & Context:
+"""
+${productsContext || 'No product data available.'}
+"""
+
 **IMPORTANT INSTRUCTIONS:**
 1. First, think step by step about the user's intent.
-2. Decide if you need to use a tool to get accurate information.
+2. Decide if you need to use a tool to extract structured product data or take action (like checking/creating orders).
 3. Use tools when the user asks about products, pricing, availability, or orders.
-4. Only respond to the user AFTER using tools if needed.
-5. Be concise and natural in your final reply.
-6. Never make up product information.`
+4. When a tool returns data, do NOT show raw brackets or code syntax to the user. Instead, process that information and respond like a natural, smooth, empathetic human salesperson.
+5. If an item is marked as negotiable, do not just state 'it is negotiable'. Engage the user conversationally (e.g., ask for their target budget or offer a minor concession to close the sale).
+6. Be concise, persuasive, and natural in your final reply. Never make up product info.`
 
   try {
     const response = await axios.post(
@@ -218,6 +225,7 @@ ${personality || 'You are friendly, professional, and focused on helping custome
 
     const message = response.data.choices[0].message
 
+    // Check if the AI decided to invoke a tool
     if (message.tool_calls?.length > 0) {
       console.log(`[AI] 🛠️ Tool Called: ${message.tool_calls[0].function.name}`)
       return {
@@ -227,6 +235,7 @@ ${personality || 'You are friendly, professional, and focused on helping custome
       }
     }
 
+    // If the LLM responds directly with text, return it cleanly
     return {
       type: "text",
       content: message.content?.trim() || "I'm here to help! What would you like to know?"
@@ -237,6 +246,7 @@ ${personality || 'You are friendly, professional, and focused on helping custome
     return { type: "text", content: "Sorry, I'm having trouble right now. Please try again." }
   }
 }
+
 
 // ========================
 // SAVE MESSAGE + SEND REPLY (Unchanged)
