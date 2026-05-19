@@ -201,22 +201,34 @@ ${productsContext || 'No product data available.'}
 6. Be concise, persuasive, and natural in your final reply. Never make up product info.`
 
   try {
+    // Map history while preserving the reasoning_details payload if it exists
+    const formattedHistory = history.slice(-8).map(m => {
+      const msgObj = {
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: m.text
+      };
+      // If this history item was saved with reasoning details, pass them back unmodified
+      if (m.role !== 'user' && m.reasoning_details) {
+        msgObj.reasoning_details = m.reasoning_details;
+      }
+      return msgObj;
+    });
+
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
         model: OPENROUTER_MODEL,
         messages: [
           { role: 'system', content: systemPrompt },
-          ...history.slice(-8).map(m => ({
-            role: m.role === 'user' ? 'user' : 'assistant',
-            content: m.text
-          })),
+          ...formattedHistory,
           { role: 'user', content: userMessage }
         ],
         tools: tools,
         tool_choice: "auto",
         temperature: 0.65,
         max_tokens: 800,
+        // Added properties required by the reasoning model
+        extra_body: { "reasoning": { "enabled": true } } 
       },
       {
         headers: {
@@ -235,30 +247,33 @@ ${productsContext || 'No product data available.'}
       return {
         type: "tool_call",
         tool: message.tool_calls[0],
-        content: message.content || ""
+        content: message.content || "",
+        reasoning_details: message.reasoning_details || null // Capture reasoning details
       }
     }
 
     return {
       type: "text",
-      content: message.content?.trim() || "I'm here to help! What would you like to know?"
+      content: message.content?.trim() || "I'm here to help! What would you like to know?",
+      reasoning_details: message.reasoning_details || null // Capture reasoning details
     }
 
   } catch (error) {
     console.error('[AI] Error:', error.response?.data || error.message)
-    return { type: "text", content: "Sorry, I'm having trouble right now. Please try again." }
+    return { type: "text", content: "Sorry, I'm having trouble right now. Please try again.", reasoning_details: null }
   }
 }
+
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
 // ========================
-async function saveMessage(businessId, phoneNumber, role, text, messageId) {
+async function saveMessage(businessId, phoneNumber, role, text, messageId, reasoningDetails = null) {
   try {
     const timestamp = Date.now()
     const normalizedPhone = phoneNumber.replace(/\D/g, '')
 
-    await db.collection('businesses').doc(businessId).collection('whatsapp_messages').add({
+    const docData = {
       contactJid: normalizedPhone,
       from: role === 'user' ? normalizedPhone : businessId,
       to: role === 'user' ? businessId : normalizedPhone,
@@ -268,13 +283,21 @@ async function saveMessage(businessId, phoneNumber, role, text, messageId) {
       messageId,
       timestamp,
       direction: role === 'user' ? 'incoming' : 'outgoing',
-    })
+    };
+
+    // If reasoning information exists, append it to the document
+    if (reasoningDetails) {
+      docData.reasoning_details = reasoningDetails;
+    }
+
+    await db.collection('businesses').doc(businessId).collection('whatsapp_messages').add(docData)
     return true
   } catch (err) {
     console.error('[DB] Save error:', err.message)
     return false
   }
 }
+
 
 async function sendReplyViaGateway(userId, jid, replyText) {
   try {
@@ -393,11 +416,15 @@ app.post('/webhook', async (req, res) => {
       replyText = aiResult.content
     }
 
+     // Capture secondary loop reasoning metadata if applicable, else use initial one
+    const finalReasoningDetails = aiResult.type === "tool_call" ? null : aiResult.reasoning_details;
+
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
-    await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
+    // Store the structured reasoning object along with the response
+    await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`, finalReasoningDetails)
 
     await sendReplyViaGateway(userId, normalizedFrom, replyText)
-
+    
     res.json({ 
       success: true, 
       reply: replyText, 
