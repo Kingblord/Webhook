@@ -157,8 +157,12 @@ case "getProductList":
 
   if (product) {
     const status = product.negotiationEnabled ? 'Negotiable' : 'Fixed price';
-    return `Product Details Found:\nName: ${product.name}\nPrice: ${product.price}\nDescription: ${product.description || 'No description provided.'}\nNegotiation Status: ${status}`;
+    return `Product Inventory Data:\n- Name: ${product.name}\n- Price: ₦${product.price}\n- Description: ${product.description || 'No description provided.'}\n- Status: ${status}`;
   }
+  
+  return `Product "${productNameArg}" not found in current inventory.`;
+}
+
   
   return `I couldn't find information about "${productNameArg}". Could you tell me the exact product name?`
     case "createOrder":
