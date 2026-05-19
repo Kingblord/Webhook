@@ -149,15 +149,18 @@ case "getProductList":
     `\n\nWhich one are you interested in?`;
 
 
-    case "getProductInfo":
-      const product = products.find(p => 
-        p.name.toLowerCase().includes((args.productName || '').toLowerCase())
-      )
-      if (product) {
-        return `${product.name} - $${product.price}\n\( {product.description || ''}\n \){product.negotiationEnabled ? '✅ This product is negotiable.' : 'Fixed price.'}`
-      }
-      return `I couldn't find information about "${args.productName}". Could you tell me the exact product name?`
+    case "getProductInfo": {
+  const productNameArg = args.productName || '';
+  const product = products.find(p => 
+    p.name.toLowerCase().includes(productNameArg.toLowerCase())
+  );
 
+  if (product) {
+    const status = product.negotiationEnabled ? 'Negotiable' : 'Fixed price';
+    return `Product Details Found:\nName: ${product.name}\nPrice: ${product.price}\nDescription: ${product.description || 'No description provided.'}\nNegotiation Status: ${status}`;
+  }
+  
+  return `I couldn't find information about "${productNameArg}". Could you tell me the exact product name?`
     case "createOrder":
       return `✅ Order started for **${args.productName}**.\nPlease provide your full name to complete the order.`
 
