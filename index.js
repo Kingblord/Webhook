@@ -65,7 +65,7 @@ async function getConversationHistory(businessId, phoneNumber, limit = 12) {
       .limit(limit)
       .get()
 
-    return snapshot.docs.map(doc => doc.data()).reverse() // oldest first
+    return snapshot.docs.map(doc => doc.data()).reverse()
   } catch (err) {
     console.error('[DB] History fetch error:', err.message)
     return []
@@ -82,7 +82,6 @@ async function getBusinessContext(businessId) {
 
     const businessData = businessDoc.data()
 
-    // Fetch products
     const productsSnapshot = await db
       .collection('businesses')
       .doc(businessId)
@@ -107,7 +106,7 @@ async function getBusinessContext(businessId) {
       businessName: businessData.name,
       aiPersonality: businessData.aiPersonality,
       productsContext,
-      products // raw products for tool execution
+      products
     }
   } catch (err) {
     console.error('[DB] Business context error:', err.message)
@@ -138,30 +137,27 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   switch (name) {
     case "getProductList":
       if (products.length === 0) return "We currently have no products listed."
-      
       return `Here are our products:\n` +
-        products.map(p => 
-          `- \( {p.name} ( \]{p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}`
-        ).join('\n') +
-        `\n\nWhich one interests you?`
+        products.map(p => `- \( {p.name} ( \]{p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}`).join('\n') +
+        `\n\nWhich one are you interested in?`
 
     case "getProductInfo":
       const product = products.find(p => 
         p.name.toLowerCase().includes((args.productName || '').toLowerCase())
       )
       if (product) {
-        return `${product.name} - $${product.price}\n\( {product.description || ''}\n \){product.negotiationEnabled ? 'This product supports negotiation.' : 'Fixed price.'}`
+        return `${product.name} - $${product.price}\n\( {product.description || ''}\n \){product.negotiationEnabled ? '✅ This product is negotiable.' : 'Fixed price.'}`
       }
-      return `Sorry, I couldn't find "${args.productName}". Please check the product name.`
+      return `I couldn't find information about "${args.productName}". Could you tell me the exact product name?`
 
     case "createOrder":
-      return `✅ Order initiated for **${args.productName}** (Qty: ${args.quantity || 1}).\nPlease tell me your full name to proceed.`
+      return `✅ Order started for **${args.productName}**.\nPlease provide your full name to complete the order.`
 
     case "getPaymentDetails":
-      return "We accept:\n• Bank Transfer\n• USSD\n• Card Payment\n\nWould you like our account details?"
+      return "We accept Bank Transfer, USSD, and Card payments.\nWould you like our account details?"
 
     case "checkOrderStatus":
-      return `I'll check the status of order #${args.orderId || 'N/A'} for you shortly.`
+      return `I'll check the status of order #${args.orderId || 'N/A'} for you.`
 
     default:
       return "I'm processing your request..."
@@ -169,19 +165,20 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
 }
 
 // ========================
-// AI DECISION BRAIN
+// AI DECISION BRAIN (Improved Reasoning)
 // ========================
 async function getAIResponse(businessName, personality, productsContext, history, userMessage) {
-  const systemPrompt = `You are a smart and helpful AI Sales Assistant for ${businessName}.
+  const systemPrompt = `You are a smart AI Sales Assistant for ${businessName}.
 
-${personality || 'You are friendly, professional, and goal-oriented towards closing sales.'}
+${personality || 'You are friendly, professional, and focused on helping customers.'}
 
-Core Rules:
-- Understand user intent: product inquiry, interest, negotiation, or ready to buy.
-- Use tools when needed instead of guessing.
-- Consider negotiationEnabled flag when customer wants to negotiate.
-- Be concise, natural, and conversational.
-- Never make up product information.`
+**IMPORTANT INSTRUCTIONS:**
+1. First, think step by step about the user's intent.
+2. Decide if you need to use a tool to get accurate information.
+3. Use tools when the user asks about products, pricing, availability, or orders.
+4. Only respond to the user AFTER using tools if needed.
+5. Be concise and natural in your final reply.
+6. Never make up product information.`
 
   try {
     const response = await axios.post(
@@ -198,8 +195,8 @@ Core Rules:
         ],
         tools: tools,
         tool_choice: "auto",
-        temperature: 0.7,
-        max_tokens: 700,
+        temperature: 0.65,
+        max_tokens: 800,
       },
       {
         headers: {
@@ -224,7 +221,7 @@ Core Rules:
 
     return {
       type: "text",
-      content: message.content?.trim() || "I'm here to help! Tell me more about what you're looking for."
+      content: message.content?.trim() || "I'm here to help! What would you like to know?"
     }
 
   } catch (error) {
@@ -234,7 +231,7 @@ Core Rules:
 }
 
 // ========================
-// SAVE MESSAGE
+// SAVE MESSAGE + SEND REPLY (Unchanged)
 // ========================
 async function saveMessage(businessId, phoneNumber, role, text, messageId) {
   try {
@@ -259,9 +256,6 @@ async function saveMessage(businessId, phoneNumber, role, text, messageId) {
   }
 }
 
-// ========================
-// SEND REPLY
-// ========================
 async function sendReplyViaGateway(userId, jid, replyText) {
   try {
     const normalizedJid = normalizeJid(jid)
@@ -323,11 +317,9 @@ app.post('/webhook', async (req, res) => {
       replyText = toolResult
     }
 
-    // Save messages
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
 
-    // Send reply
     await sendReplyViaGateway(userId, normalizedFrom, replyText)
 
     res.json({ 
@@ -343,9 +335,6 @@ app.post('/webhook', async (req, res) => {
   }
 })
 
-// ========================
-// HEALTH CHECK
-// ========================
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', service: 'AroMsg AI Decision Brain' })
 })
