@@ -3,9 +3,6 @@ const dotenv = require('dotenv')
 const axios = require('axios')
 const admin = require('firebase-admin')
 
-// Official Baileys JID Normalizer
-
-
 const { jidNormalizedUser } = require("@whiskeysockets/baileys")
 
 dotenv.config()
@@ -22,17 +19,9 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID
 const FIREBASE_PRIVATE_KEY = process.env.FIREBASE_PRIVATE_KEY
 const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'openrouter/free'
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp'
+
 const PORT = process.env.PORT || 3000
-
-if (!OPENROUTER_API_KEY) {
-  console.warn('⚠️ OPENROUTER_API_KEY is not set in .env file')
-}
-
-if (!FIREBASE_PROJECT_ID || !FIREBASE_PRIVATE_KEY || !FIREBASE_CLIENT_EMAIL) {
-  console.error('❌ Firebase credentials missing: FIREBASE_PROJECT_ID, FIREBASE_PRIVATE_KEY, FIREBASE_CLIENT_EMAIL')
-  process.exit(1)
-}
 
 // ========================
 // FIREBASE INITIALIZATION
@@ -63,112 +52,54 @@ function normalizeJid(jid) {
 }
 
 // ========================
-// AI RESPONSE USING OPENROUTER
+// GET CONVERSATION HISTORY
 // ========================
-
-async function getAIResponse(userMessage, systemPrompt) {
+async function getConversationHistory(businessId, phoneNumber, limit = 12) {
   try {
-    console.log('[AI] 🤖 Calling OpenRouter API with model:', OPENROUTER_MODEL)
-    const response = await axios.post(
-      'https://openrouter.ai/api/v1/chat/completions',
-      {
-        model: OPENROUTER_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.7,
-        max_tokens: 500,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          'HTTP-Referer': 'https://aromsg.up.railway.app',
-          'X-Title': 'AroMsg WhatsApp AI Service',
-        },
-        timeout: 15000,
-      }
-    )
-
-    const reply = response.data.choices[0]?.message?.content?.trim()
-    console.log('[AI] ✅ OpenRouter response received:', reply.substring(0, 100) + '...')
-    return reply || 'Sorry, I could not generate a response right now.'
-  } catch (error) {
-    console.error('[AI] ❌ OpenRouter API Error:', error.response?.data || error.message)
-    return 'Sorry, I am having trouble thinking right now. Please try again later.'
-  }
-}
-
-// ========================
-// FIND BUSINESS FOR CUSTOMER
-// ========================
-
-async function findBusinessForCustomer(phoneNumber) {
-  try {
-    console.log(`[DB] 🔍 Finding business for customer: ${phoneNumber}`)
-
-    const contactsSnapshot = await db
-      .collectionGroup('contacts')
-      .where('phone', '==', phoneNumber.replace(/\D/g, ''))
-      .limit(1)
+    const snapshot = await db
+      .collection('businesses')
+      .doc(businessId)
+      .collection('whatsapp_messages')
+      .where('contactJid', '==', phoneNumber.replace(/\D/g, ''))
+      .orderBy('timestamp', 'desc')
+      .limit(limit)
       .get()
 
-    if (contactsSnapshot.empty) {
-      console.log(`[DB] ⚠️ No contact found for: ${phoneNumber}`)
-      return null
-    }
-
-    const contactDoc = contactsSnapshot.docs[0]
-    const contactData = contactDoc.data()
-    const businessId = contactData.businessId
-
-    console.log(`[DB] ✅ Found business: ${businessId}`)
-    return businessId
+    return snapshot.docs.map(doc => doc.data()).reverse() // oldest first
   } catch (err) {
-    console.error('[DB] ❌ Error finding business:', err.message)
-    return null
+    console.error('[DB] History fetch error:', err.message)
+    return []
   }
 }
 
 // ========================
-// GET BUSINESS CONTEXT & PRODUCTS
+// GET BUSINESS CONTEXT + PRODUCTS
 // ========================
-
 async function getBusinessContext(businessId) {
   try {
-    console.log(`[DB] 📦 Loading business config for: ${businessId}`)
-
     const businessDoc = await db.collection('businesses').doc(businessId).get()
-    if (!businessDoc.exists) {
-      console.log(`[DB] ❌ Business not found: ${businessId}`)
-      return null
-    }
+    if (!businessDoc.exists) return null
 
     const businessData = businessDoc.data()
-    console.log(`[DB] ✅ Business loaded: ${businessData.name}`)
 
+    // Fetch products
     let productsContext = ''
-    try {
-      const productsSnapshot = await db
-        .collection('businesses')
-        .doc(businessId)
-        .collection('products')
-        .orderBy('createdAt', 'desc')
-        .get()
+    const productsSnapshot = await db
+      .collection('businesses')
+      .doc(businessId)
+      .collection('products')
+      .get()
 
-      if (!productsSnapshot.empty) {
-        console.log(`[DB] 🛍️ Found ${productsSnapshot.size} products`)
-        const productsList = productsSnapshot.docs
-          .map((doc) => {
-            const product = doc.data()
-            return `- ${product.name} ($${product.price}${product.negotiationEnabled ? ', negotiable' : ''}): ${product.description}`
-          })
-          .join('\n')
+    const products = productsSnapshot.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }))
 
-        productsContext = '\n\nAvailable products:\n' + productsList
-      }
-    } catch (err) {
-      console.error('[DB] ⚠️ Error fetching products:', err.message)
+    if (products.length > 0) {
+      productsContext = '\n\nAvailable Products:\n' + 
+        products.map(p => 
+          `- \( {p.name} (\[ {p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}: ${p.description || ''}`
+        ).join('\n')
     }
 
     return {
@@ -176,23 +107,138 @@ async function getBusinessContext(businessId) {
       businessName: businessData.name,
       aiPersonality: businessData.aiPersonality,
       productsContext,
+      products // raw products for tool execution
     }
   } catch (err) {
-    console.error('[DB] ❌ Error getting business context:', err.message)
+    console.error('[DB] Business context error:', err.message)
     return null
   }
 }
 
 // ========================
-// SAVE MESSAGE TO FIRESTORE
+// TOOL DEFINITIONS
 // ========================
+const tools = [
+  { type: "function", function: { name: "getProductList", description: "Return list of all available products", parameters: { type: "object", properties: {}, required: [] } }},
+  { type: "function", function: { name: "getProductInfo", description: "Get detailed info about a specific product", parameters: { type: "object", properties: { productName: { type: "string" }}, required: ["productName"] } }},
+  { type: "function", function: { name: "createOrder", description: "Create order when customer is ready to buy", parameters: { type: "object", properties: { productName: { type: "string" }, quantity: { type: "number", default: 1 }, customerName: { type: "string" }}, required: ["productName"] } }},
+  { type: "function", function: { name: "getPaymentDetails", description: "Get payment methods and instructions", parameters: { type: "object", properties: {}, required: [] } }},
+  { type: "function", function: { name: "checkOrderStatus", description: "Check status of an existing order", parameters: { type: "object", properties: { orderId: { type: "string" }}, required: ["orderId"] } }}
+]
 
+// ========================
+// TOOL EXECUTION LAYER
+// ========================
+async function executeTool(toolCall, businessId, phoneNumber, products = []) {
+  const { name, arguments: argsStr } = toolCall.function
+  const args = JSON.parse(argsStr || '{}')
+
+  console.log(`[TOOL] Executing ${name} with args:`, args)
+
+  switch (name) {
+    case "getProductList":
+      return products.length > 0 
+        ? `Here are our products:\n${products.map(p => `- \( {p.name} ( \]{p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}`).join('\n')}\n\nWhich one interests you?`
+        : "We currently have no products listed."
+
+    case "getProductInfo":
+      const product = products.find(p => 
+        p.name.toLowerCase().includes(args.productName.toLowerCase())
+      )
+      if (product) {
+        return `${product.name} - $${product.price}\n\( {product.description || ''}\n \){product.negotiationEnabled ? 'This product is negotiable.' : 'Fixed price.'}`
+      }
+      return `Sorry, I couldn't find information about "${args.productName}".`
+
+    case "createOrder":
+      // TODO: You can expand this to actually create order document
+      return `✅ Order started for **${args.productName}** (Qty: ${args.quantity || 1}).\nPlease provide your full name to proceed.`
+
+    case "getPaymentDetails":
+      return "We accept:\n• Bank Transfer\n• USSD\n• Card Payment\n\nWould you like our account details?"
+
+    case "checkOrderStatus":
+      return `I'll check the status of order #${args.orderId} for you...`
+
+    default:
+      return "I'm processing your request..."
+  }
+}
+
+// ========================
+// AI DECISION BRAIN
+// ========================
+async function getAIResponse(businessName, personality, productsContext, history, userMessage) {
+  const systemPrompt = `You are a smart and helpful AI Sales Assistant for ${businessName}.
+
+${personality || 'You are friendly, professional, and goal-oriented towards closing sales.'}
+
+Core Rules:
+- Understand user intent: product inquiry, interest, negotiation, or ready to buy.
+- Use tools when needed instead of guessing.
+- Consider negotiationEnabled flag when customer wants to negotiate.
+- Be concise, natural, and conversational.
+- Never make up product information.`
+
+  try {
+    const response = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: OPENROUTER_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...history.slice(-8).map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.text
+          })),
+          { role: 'user', content: userMessage }
+        ],
+        tools: tools,
+        tool_choice: "auto",
+        temperature: 0.7,
+        max_tokens: 700,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          'HTTP-Referer': 'https://aromsg.up.railway.app',
+          'X-Title': 'AroMsg WhatsApp AI',
+        },
+        timeout: 20000,
+      }
+    )
+
+    const message = response.data.choices[0].message
+
+    if (message.tool_calls?.length > 0) {
+      console.log(`[AI] 🛠️ Tool Called: ${message.tool_calls[0].function.name}`)
+      return {
+        type: "tool_call",
+        tool: message.tool_calls[0],
+        content: message.content || ""
+      }
+    }
+
+    return {
+      type: "text",
+      content: message.content?.trim() || "I'm here to help! Tell me more about what you're looking for."
+    }
+
+  } catch (error) {
+    console.error('[AI] Error:', error.response?.data || error.message)
+    return { type: "text", content: "Sorry, I'm having trouble right now. Please try again." }
+  }
+}
+
+// ========================
+// SAVE MESSAGE
+// ========================
 async function saveMessage(businessId, phoneNumber, role, text, messageId) {
   try {
     const timestamp = Date.now()
     const normalizedPhone = phoneNumber.replace(/\D/g, '')
 
-    const messageDoc = {
+    await db.collection('businesses').doc(businessId).collection('whatsapp_messages').add({
       contactJid: normalizedPhone,
       from: role === 'user' ? normalizedPhone : businessId,
       to: role === 'user' ? businessId : normalizedPhone,
@@ -202,209 +248,107 @@ async function saveMessage(businessId, phoneNumber, role, text, messageId) {
       messageId,
       timestamp,
       direction: role === 'user' ? 'incoming' : 'outgoing',
-    }
-
-    await db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('whatsapp_messages')
-      .add(messageDoc)
-
-    console.log(`[DB] 💾 Message saved - Role: ${role}, Phone: ${normalizedPhone}`)
+    })
     return true
   } catch (err) {
-    console.error('[DB] ❌ Error saving message:', err.message)
+    console.error('[DB] Save error:', err.message)
     return false
   }
 }
 
 // ========================
-// SEND REPLY VIA GATEWAY (Updated with Official Normalizer)
+// SEND REPLY
 // ========================
-
-async function sendReplyViaGateway(userId, phoneNumber, replyText) {
+async function sendReplyViaGateway(userId, jid, replyText) {
   try {
-    console.log(`[GATEWAY] 📤 Sending reply to ${phoneNumber}`)
-
-    // Use Official Baileys Normalizer
-    const normalizedJid = normalizeJid(phoneNumber);
-
-    const response = await axios.post(
-      `${GATEWAY_URL}/send-message`,
-      {
-        userId,
-        to: normalizedJid,           // ← Now using official normalized JID
-        text: replyText,
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${INTERNAL_API_KEY}`,
-        },
-        timeout: 10000,
-      }
-    )
-
-    console.log(`[GATEWAY] ✅ Reply queued successfully to ${normalizedJid}`)
+    const normalizedJid = normalizeJid(jid)
+    await axios.post(`${GATEWAY_URL}/send-message`, {
+      userId,
+      to: normalizedJid,
+      text: replyText,
+    }, {
+      headers: { Authorization: `Bearer ${INTERNAL_API_KEY}` },
+      timeout: 10000,
+    })
+    console.log(`[GATEWAY] ✅ Sent to ${normalizedJid}`)
     return true
   } catch (err) {
-    console.error('[GATEWAY] ❌ Failed to send reply:', err.message)
+    console.error('[GATEWAY] Failed:', err.message)
     return false
   }
 }
 
 // ========================
-// MAIN WEBHOOK ENDPOINT
+// MAIN WEBHOOK
 // ========================
-
 app.post('/webhook', async (req, res) => {
   try {
     const authHeader = req.headers.authorization
-
     if (!authHeader || authHeader !== `Bearer ${INTERNAL_API_KEY}`) {
-      console.log('[AUTH] ❌ Unauthorized webhook attempt')
       return res.status(401).json({ success: false, error: 'Unauthorized' })
     }
 
-    const { userId, from, text, platform, messageId, timestamp } = req.body
-
-    console.log('\n' + '='.repeat(60))
-    console.log('[WEBHOOK] 📨 WEBHOOK RECEIVED')
-    console.log('='.repeat(60))
-    console.log('[WEBHOOK] Payload:', JSON.stringify(req.body, null, 2))
-
+    const { userId, from, text, messageId } = req.body
     if (!userId || !from || !text) {
-      console.log('[WEBHOOK] ❌ Missing required fields')
-      return res.status(400).json({ success: false, error: 'Missing required fields' })
+      return res.status(400).json({ success: false, error: 'Missing fields' })
     }
 
-    // Use official normalizer
-    const normalizedFrom = normalizeJid(from);
-    const phoneNumber = normalizedFrom.replace('@s.whatsapp.net', '');
+    const normalizedFrom = normalizeJid(from)
+    const phoneNumber = normalizedFrom.replace('@s.whatsapp.net', '')
 
-    console.log(`[WEBHOOK] 📍 Normalized JID: ${normalizedFrom}`);
+    console.log(`[WEBHOOK] 📨 Message from ${phoneNumber}: ${text.substring(0, 70)}...`)
 
-    // ========================
-    // SAVE INCOMING MESSAGE
-    // ========================
-    console.log('[WEBHOOK] 💾 Saving incoming message...')
-    const incomingMessageId = messageId || `in_${Date.now()}`
-    await saveMessage(userId, phoneNumber, 'user', text, incomingMessageId)
-
-    // ========================
-    // BUSINESS CONTEXT
-    // ========================
-    let businessId = userId
-    console.log(`[WEBHOOK] 📍 Using businessId: ${businessId}`)
-
-    console.log('[WEBHOOK] 📦 Loading business context...')
-    const context = await getBusinessContext(businessId)
+    const history = await getConversationHistory(userId, phoneNumber)
+    const context = await getBusinessContext(userId)
 
     if (!context) {
-      console.log('[WEBHOOK] ❌ Could not load business context')
-      return res.status(404).json({ success: false, error: 'Business context not found' })
+      return res.status(404).json({ success: false, error: 'Business not found' })
     }
 
-    // ========================
-    // BUILD SYSTEM PROMPT
-    // ========================
-    const personality = context.aiPersonality || 'You are a friendly and professional sales assistant.'
+    const aiResult = await getAIResponse(
+      context.businessName,
+      context.aiPersonality,
+      context.productsContext,
+      history,
+      text
+    )
 
-    const systemPrompt =
-      `You are an AI sales assistant for ${context.businessName}.\n\n` +
-      `\( {personality} \){context.productsContext}\n\n` +
-      `Keep replies concise (1-3 sentences). Never make up product information. ` +
-      `If a customer asks about negotiation on a product, check if negotiation is available. ` +
-      `Never reveal you are an AI unless directly asked.`
+    let replyText = aiResult.content
 
-    console.log('[WEBHOOK] 🧠 System prompt prepared')
+    if (aiResult.type === "tool_call") {
+      const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products)
+      replyText = toolResult
+    }
 
-    // ========================
-    // GENERATE AI RESPONSE
-    // ========================
-    console.log('[WEBHOOK] 🤖 Generating AI response...')
-    const aiReply = await getAIResponse(text, systemPrompt)
+    // Save messages
+    await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
+    await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
 
-    // ========================
-    // SAVE AI RESPONSE
-    // ========================
-    console.log('[WEBHOOK] 💾 Saving AI response...')
-    const responseMessageId = `ai_${Date.now()}`
-    await saveMessage(businessId, phoneNumber, 'assistant', aiReply, responseMessageId)
+    // Send reply
+    await sendReplyViaGateway(userId, normalizedFrom, replyText)
 
-    // ========================
-    // SEND REPLY VIA GATEWAY
-    // ========================
-    console.log('[WEBHOOK] 📤 Sending reply via gateway...')
-    await sendReplyViaGateway(businessId, normalizedFrom, aiReply)   // ← Using normalized JID
-
-    console.log('[WEBHOOK] ✅ Webhook complete')
-    console.log('='.repeat(60) + '\n')
-
-    res.json({
-      success: true,
-      aiReply,
-      messagesSaved: true,
-      gatewaySent: true,
+    res.json({ 
+      success: true, 
+      reply: replyText, 
+      mode: aiResult.type,
+      tool: aiResult.type === "tool_call" ? aiResult.tool.function.name : null 
     })
+
   } catch (err) {
-    console.error('[WEBHOOK] ❌ Unhandled error:', err.message)
-    res.status(500).json({
-      success: false,
-      error: 'Internal server error',
-    })
+    console.error('[WEBHOOK] Error:', err.message)
+    res.status(500).json({ success: false, error: 'Internal server error' })
   }
 })
 
 // ========================
 // HEALTH CHECK
 // ========================
-
-app.get('/health', async (req, res) => {
-  // ... (your existing health check logic - unchanged)
-  try {
-    const health = {
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      checks: {
-        api_key: !!INTERNAL_API_KEY,
-        openrouter_key: !!OPENROUTER_API_KEY,
-        firebase: !!db,
-        gateway: false,
-      },
-    }
-
-    try {
-      const gatewayRes = await axios.get(`${GATEWAY_URL}/health`, { timeout: 5000 })
-      health.checks.gateway = gatewayRes.status === 200
-    } catch (err) {
-      health.checks.gateway = false
-    }
-
-    const allHealthy = Object.values(health.checks).every((v) => v === true)
-    health.status = allHealthy ? 'healthy' : 'degraded'
-
-    console.log('[HEALTH] Status:', health.status)
-    res.status(allHealthy ? 200 : 503).json(health)
-  } catch (err) {
-    console.error('[HEALTH] Error:', err.message)
-    res.status(500).json({ status: 'unhealthy', error: err.message })
-  }
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', service: 'AroMsg AI Decision Brain' })
 })
 
-// ========================
-// START SERVER
-// ========================
-
 app.listen(PORT, () => {
-  console.log('\n' + '='.repeat(60))
-  console.log('🚀 AI Webhook Service Starting')
-  console.log('='.repeat(60))
-  console.log(`Port: ${PORT}`)
-  console.log(`Gateway URL: ${GATEWAY_URL}`)
-  console.log(`OpenRouter Model: ${OPENROUTER_MODEL}`)
-  console.log(`Firebase Project: ${FIREBASE_PROJECT_ID}`)
-  console.log('='.repeat(60) + '\n')
+  console.log(`🚀 AroMsg AI Decision Brain running on port ${PORT}`)
 })
 
 module.exports = app
