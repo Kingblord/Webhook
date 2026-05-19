@@ -130,6 +130,9 @@ const tools = [
 // ========================
 // TOOL EXECUTION LAYER
 // ========================
+// ========================
+// TOOL EXECUTION LAYER (FIXED)
+// ========================
 async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   const { name, arguments: argsStr } = toolCall.function
   const args = JSON.parse(argsStr || '{}')
@@ -137,47 +140,49 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   console.log(`[TOOL] Executing ${name} with args:`, args)
 
   switch (name) {
-    // Replace your existing getProductList case with this:
-case "getProductList":
-  if (products.length === 0) return "We currently have no products listed."
-  
-  return `Here are our products:\n` +
-    products.map(p => {
-      const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
-      return `• ${p.name} (${p.price})${negotiable}`;
-    }).join('\n') +
-    `\n\nWhich one are you interested in?`;
-
+    case "getProductList": {
+      if (products.length === 0) return "We currently have no products listed."
+      
+      return `Here are our products:\n` +
+        products.map(p => {
+          const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
+          return `• ${p.name} (${p.price})${negotiable}`;
+        }).join('\n') +
+        `\n\nWhich one are you interested in?`;
+    }
 
     case "getProductInfo": {
-  const productNameArg = args.productName || '';
-  const product = products.find(p => 
-    p.name.toLowerCase().includes(productNameArg.toLowerCase())
-  );
+      const productNameArg = args.productName || '';
+      const product = products.find(p => 
+        p.name.toLowerCase().includes(productNameArg.toLowerCase())
+      );
 
-  if (product) {
-    const status = product.negotiationEnabled ? 'Negotiable' : 'Fixed price';
-    return `Product Inventory Data:\n- Name: ${product.name}\n- Price: ₦${product.price}\n- Description: ${product.description || 'No description provided.'}\n- Status: ${status}`;
+      if (product) {
+        const status = product.negotiationEnabled ? 'Negotiable' : 'Fixed price';
+        return `Product Inventory Data:\n- Name: ${product.name}\n- Price: ${product.price}\n- Description: ${product.description || 'No description provided.'}\n- Status: ${status}`;
+      }
+      
+      return `Product "${productNameArg}" not found in current inventory.`;
+    }
+
+    case "createOrder": {
+      return `✅ Order started for **${args.productName}**.\nPlease provide your full name to complete the order.`;
+    }
+
+    case "getPaymentDetails": {
+      return "We accept Bank Transfer, USSD, and Card payments.\nWould you like our account details?";
+    }
+
+    case "checkOrderStatus": {
+      return `I'll check the status of order #${args.orderId || 'N/A'} for you.`;
+    }
+
+    default: {
+      return "I'm processing your request...";
+    }
   }
-  
-  return `Product "${productNameArg}" not found in current inventory.`;
 }
 
-  
-  return `I couldn't find information about "${productNameArg}". Could you tell me the exact product name?`
-    case "createOrder":
-      return `✅ Order started for **${args.productName}**.\nPlease provide your full name to complete the order.`
-
-    case "getPaymentDetails":
-      return "We accept Bank Transfer, USSD, and Card payments.\nWould you like our account details?"
-
-    case "checkOrderStatus":
-      return `I'll check the status of order #${args.orderId || 'N/A'} for you.`
-
-    default:
-      return "I'm processing your request..."
-  }
-}
 
 // ========================
 // AI DECISION BRAIN (Improved Reasoning)
