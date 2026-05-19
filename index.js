@@ -5,7 +5,6 @@ const admin = require('firebase-admin')
 
 const { jidNormalizedUser } = require("@whiskeysockets/baileys")
 
-
 dotenv.config()
 
 const app = express()
@@ -84,7 +83,6 @@ async function getBusinessContext(businessId) {
     const businessData = businessDoc.data()
 
     // Fetch products
-    let productsContext = ''
     const productsSnapshot = await db
       .collection('businesses')
       .doc(businessId)
@@ -96,6 +94,7 @@ async function getBusinessContext(businessId) {
       ...doc.data()
     }))
 
+    let productsContext = ''
     if (products.length > 0) {
       productsContext = '\n\nAvailable Products:\n' + 
         products.map(p => 
@@ -138,28 +137,31 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
 
   switch (name) {
     case "getProductList":
-      return products.length > 0 
-        ? `Here are our products:\n${products.map(p => `- \( {p.name} ( \]{p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}`).join('\n')}\n\nWhich one interests you?`
-        : "We currently have no products listed."
+      if (products.length === 0) return "We currently have no products listed."
+      
+      return `Here are our products:\n` +
+        products.map(p => 
+          `- \( {p.name} ( \]{p.price}) \){p.negotiationEnabled ? ' [Negotiable]' : ''}`
+        ).join('\n') +
+        `\n\nWhich one interests you?`
 
     case "getProductInfo":
       const product = products.find(p => 
-        p.name.toLowerCase().includes(args.productName.toLowerCase())
+        p.name.toLowerCase().includes((args.productName || '').toLowerCase())
       )
       if (product) {
-        return `${product.name} - $${product.price}\n\( {product.description || ''}\n \){product.negotiationEnabled ? 'This product is negotiable.' : 'Fixed price.'}`
+        return `${product.name} - $${product.price}\n\( {product.description || ''}\n \){product.negotiationEnabled ? 'This product supports negotiation.' : 'Fixed price.'}`
       }
-      return `Sorry, I couldn't find information about "${args.productName}".`
+      return `Sorry, I couldn't find "${args.productName}". Please check the product name.`
 
     case "createOrder":
-      // TODO: You can expand this to actually create order document
-      return `✅ Order started for **${args.productName}** (Qty: ${args.quantity || 1}).\nPlease provide your full name to proceed.`
+      return `✅ Order initiated for **${args.productName}** (Qty: ${args.quantity || 1}).\nPlease tell me your full name to proceed.`
 
     case "getPaymentDetails":
       return "We accept:\n• Bank Transfer\n• USSD\n• Card Payment\n\nWould you like our account details?"
 
     case "checkOrderStatus":
-      return `I'll check the status of order #${args.orderId} for you...`
+      return `I'll check the status of order #${args.orderId || 'N/A'} for you shortly.`
 
     default:
       return "I'm processing your request..."
