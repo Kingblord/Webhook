@@ -139,7 +139,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'getProductInfo',
-      description: 'Get detailed info about a specific product',
+      description: 'Get detailed info about a specific product by name or description',
       parameters: {
         type: 'object',
         properties: { productName: { type: 'string' } },
@@ -200,11 +200,11 @@ const AI_TOOLS = [
 const CRITICAL_DIRECTIVES = `
 **CRITICAL OPERATIONAL DIRECTIVES:**
 1. First, think step by step about the user's intent.
-2. Decide if you need to use a tool to extract structured product data or take action (like checking/creating orders or generating custom checkout data).
-3. Use tools when the user asks about products, pricing, availability, orders, or when they are ready to make a payment.
-4. When a tool returns data, do NOT show raw brackets or code syntax to the user. Instead, process that information and respond like a natural, smooth, empathetic human salesperson.
-5. If an item is marked as negotiable, do not just state 'it is negotiable'. Engage the user conversationally.
-6. Be concise, persuasive, and natural in your final reply. Never make up product info.
+2. Decide if you need to use a tool to extract structured product data or take action.
+3. Use getProductInfo when user mentions a specific product.
+4. Use tools when the user asks about products, pricing, availability, orders, or payment.
+5. When a tool returns data, process it naturally.
+6. Be concise, persuasive, and natural.
 `
 
 // ========================
@@ -225,6 +225,44 @@ const ERROR_MESSAGES = {
 }
 
 // ========================
+// FUZZY PRODUCT MATCHING
+// ========================
+function findBestProductMatch(query, products) {
+  if (!query || !products.length) return null;
+  query = query.toLowerCase().trim();
+
+  let bestMatch = null;
+  let highestScore = 0;
+
+  for (const product of products) {
+    const name = (product.name || '').toLowerCase();
+    const desc = (product.description || '').toLowerCase();
+
+    // Multiple matching strategies
+    let score = 0;
+    
+    if (name.includes(query) || query.includes(name)) score = 0.9;
+    else {
+      // Partial word matching
+      const queryWords = query.split(/\s+/);
+      const nameWords = name.split(/\s+/);
+      let matches = 0;
+      for (const qw of queryWords) {
+        if (nameWords.some(nw => nw.includes(qw) || qw.includes(nw))) matches++;
+      }
+      score = matches / queryWords.length;
+    }
+
+    if (score > highestScore) {
+      highestScore = score;
+      bestMatch = product;
+    }
+  }
+
+  return highestScore > 0.4 ? bestMatch : null;
+}
+
+// ========================
 // TOOL EXECUTION LAYER
 // ========================
 async function executeTool(toolCall, businessId, phoneNumber, products = [], context = {}) {
@@ -242,39 +280,29 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     case 'getProductList': {
       if (!products || products.length === 0) return ERROR_MESSAGES.productNotFound
 
-      // Improved product list formatting - ensure clean names
       return (
         'PRODUCT_LIST:' +
         products
           .map((p, index) => {
-            const name = p.name?.trim() || `Product ${index + 1}`;
-            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
+            const name = (p.name || `Product ${index + 1}`).trim();
             const price = p.price ? `₦${parseFloat(p.price).toLocaleString()}` : 'Price on request';
+            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
             return `${index + 1}. ${name} - \( {price} \){negotiable}`;
           })
           .join('\n') +
-        '\n\nWhich one are you interested in?'
+        '\n\nWhich one interests you?'
       )
     }
 
     case 'getProductInfo': {
-      const productNameArg = (args.productName || '').toLowerCase().trim();
-      let product = products.find((p) =>
-        (p.name || '').toLowerCase().includes(productNameArg)
-      );
-
-      if (!product) {
-        product = products.find((p) => 
-          (p.description || '').toLowerCase().includes(productNameArg)
-        );
-      }
-
+      const product = findBestProductMatch(args.productName, products);
+      
       if (product) {
         return `PRODUCT_INFO:${JSON.stringify({
           name: product.name,
           price: product.price,
-          description: product.description || 'No description provided.',
-          negotiationEnabled: product.negotiationEnabled
+          description: product.description || 'No additional description available.',
+          negotiationEnabled: !!product.negotiationEnabled
         })}`
       }
       return ERROR_MESSAGES.productNotFound
@@ -465,13 +493,12 @@ ${CRITICAL_DIRECTIVES}`
 const getRefinementDirectives = (businessName, currency) => `You are a smooth, persuasive AI Sales Assistant for ${businessName}.
 
 **CRITICAL OPERATIONAL DIRECTIVES:**
-1. Answer the customer's request conversationally using the database data provided above.
-2. Format all prices matching the profile's preferred currency system: "${currency}".
-3. If the data contains RAW_KORAPAY_RESPONSE, carefully extract Bank Name, Account Number, Account Name, Amount, Reference and Expiry from the data object. Present them naturally.
-4. For PRODUCT_LIST data, format it as a clean numbered list with proper product names.
-5. Always mention expiry time for payments and add friendly urgency.
-6. NEVER output raw JSON, code, or technical tags. Make every response warm, professional and WhatsApp-friendly.
-7. Keep messages concise.`
+1. Use only the data provided in "Database Response".
+2. For PRODUCT_LIST: Format as clean numbered list with full product names.
+3. For PRODUCT_INFO: Present product details naturally with price and description.
+4. For RAW_KORAPAY_RESPONSE: Extract bank details cleanly and naturally. Mention expiry.
+5. NEVER output raw JSON or tags. Always respond like a friendly salesperson.
+6. Be concise and WhatsApp-friendly.`
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
@@ -608,18 +635,12 @@ app.post('/webhook', async (req, res) => {
           {
             model: userModel,
             messages: [
-              {
-                role: 'system',
-                content: refinementPrompt,
-              },
+              { role: 'system', content: refinementPrompt },
               ...history.slice(-8).map((m) => ({
                 role: m.role === 'user' ? 'user' : 'assistant',
                 content: m.text,
               })),
-              {
-                role: 'user',
-                content: text,
-              },
+              { role: 'user', content: text },
             ],
             temperature: 0.7,
             max_tokens: 500,
@@ -635,7 +656,6 @@ app.post('/webhook', async (req, res) => {
         )
 
         replyText = refinedResponse.data.choices[0]?.message?.content?.trim() || ERROR_MESSAGES.toolExecution
-        console.log('[WEBHOOK] ✅ Refined response:', replyText.substring(0, 100))
       } catch (refineErr) {
         console.error('[WEBHOOK] ⚠️ Refinement error:', refineErr.message)
         replyText = toolResult.replace(/RAW_KORAPAY_RESPONSE:|PRODUCT_LIST:|PRODUCT_INFO:|ORDER_/g, '').trim()
@@ -731,8 +751,6 @@ app.post('/korapay-webhook', async (req, res) => {
             })
 
             await notifyPaymentSuccess(doc.ref.parent.parent.id, orderData.phoneNumber, orderData)
-            
-            console.log(`[KORA-WEBHOOK] ✅ Order updated and customer notified for ${reference}`)
           }
         }
       } catch (dbErr) {
@@ -744,12 +762,6 @@ app.post('/korapay-webhook', async (req, res) => {
     } 
     else if (reference.startsWith('PRODB-') || reference.includes('productb')) {
       await forwardToProduct(PRODUCT_B_WEBHOOK, body)
-    } 
-    else if (reference.startsWith('REF-')) {
-      console.log('[KORA-WEBHOOK] Non-success event for REF- order')
-    } 
-    else {
-      await forwardToProduct(PRODUCT_A_WEBHOOK, body)
     }
   })
 })
