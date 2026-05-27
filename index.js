@@ -200,10 +200,10 @@ const AI_TOOLS = [
 const CRITICAL_DIRECTIVES = `
 **CRITICAL OPERATIONAL DIRECTIVES:**
 1. First, think step by step about the user's intent.
-2. Decide if you need to use a tool to extract structured product data or take action (like checking/creating orders or generating custom checkout data).
+2. Decide if you need to use a tool to extract structured product data or take action.
 3. Use tools when the user asks about products, pricing, availability, orders, or when they are ready to make a payment.
-4. When a tool returns data, do NOT show raw brackets or code syntax to the user. Instead, process that information and respond like a natural, smooth, empathetic human salesperson.
-5. If an item is marked as negotiable, do not just state 'it is negotiable'. Engage the user conversationally.
+4. When a tool returns data, do NOT show raw brackets or code syntax to the user.
+5. Never reveal any internal floor/minimum prices — only show the displayed price.
 6. Be concise, persuasive, and natural in your final reply. Never make up product info.
 `
 
@@ -240,15 +240,14 @@ function findBestProductMatch(query, products) {
     
     let score = 0;
     
-    if (name.includes(query) || query.includes(name.split(' ')[0])) {
+    if (name.includes(query) || query.includes(name.split(' ').slice(0, 3).join(' '))) {
       score = 0.95;
     } else {
       const queryWords = query.split(/\s+/);
       const nameWords = name.split(/\s+/);
-      let matches = 0;
-      for (const qw of queryWords) {
-        if (nameWords.some(nw => nw.includes(qw) || qw.includes(nw))) matches++;
-      }
+      let matches = queryWords.filter(qw => 
+        nameWords.some(nw => nw.includes(qw) || qw.includes(nw))
+      ).length;
       score = matches / Math.max(queryWords.length, 1);
     }
 
@@ -264,7 +263,7 @@ function findBestProductMatch(query, products) {
 // ========================
 // TOOL EXECUTION LAYER
 // ========================
-async function executeTool(toolCall, businessId, phoneNumber, products = []) {
+async function executeTool(toolCall, businessId, phoneNumber, products = [], context = {}) {
   const { name, arguments: argsStr } = toolCall.function
   let args = {}
   try {
@@ -286,7 +285,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
             const name = (p.name || `Product ${index + 1}`).trim();
             const price = p.price ? `₦${parseFloat(p.price).toLocaleString()}` : 'Price on request';
             const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
-            return `${index + 1}. ${name} - \( {price} \){negotiable}`;
+            return `\( {index + 1}. ** \){name}** - \( {price} \){negotiable}`;
           })
           .join('\n') +
         '\n\nWhich one are you interested in?'
@@ -330,17 +329,17 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
 
     case 'getPaymentDetails': {
       try {
-        const reference = `REF-\( {Date.now()}- \){phoneNumber.slice(-4)}`;
-        const amountToCharge = parseFloat(args.agreedPrice) || 0;
-        const targetProduct = args.productName || 'Order Transaction';
-        const customerName = args.customerName || 'WhatsApp Client';
+        const reference = `REF-\( {Date.now()}- \){phoneNumber.slice(-4)}`
+        const amountToCharge = parseFloat(args.agreedPrice) || 0
+        const targetProduct = args.productName || 'Order Transaction'
+        const customerName = args.customerName || 'WhatsApp Client'
 
         if (amountToCharge <= 0) {
-          return "We accept bank transfers via automated checkout options. Could you confirm the item you want so I can pull up account information?";
+          return "We accept bank transfers via automated checkout. Could you confirm the item and price?"
         }
 
-        console.log(`[KORAPAY] Initializing dynamic checkout parameters for reference: ${reference}, amount: ${amountToCharge}`);
-        
+        console.log(`[KORAPAY] Creating dynamic account for ${reference}, amount: ${amountToCharge}`)
+
         const koraResponse = await axios.post(`https://checkout.korapay.com/?type=payment-link`, {
           amount: amountToCharge,
           reference: reference,
@@ -358,9 +357,9 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
             'content-type': 'application/json'
           },
           timeout: 15000
-        });
+        })
 
-        const koraData = koraResponse.data;
+        const koraData = koraResponse.data
 
         if (koraData && koraData.success && koraData.data?.bank_account_number) {
           await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
@@ -371,10 +370,10 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
             customerName,
             status: 'pending',
             createdAt: Date.now(),
+            orderLinked: true,
             koraRawResponse: koraData
-          });
+          })
 
-          // Return RAW response for AI to parse naturally
           return `RAW_KORAPAY_RESPONSE:${JSON.stringify({
             success: koraData.success,
             data: koraData.data,
@@ -382,14 +381,14 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
             amount: amountToCharge,
             product: targetProduct,
             expiryMinutes: 20
-          })}`;
+          })}`
         }
         
-        return `KORAPAY_FALLBACK_INFO:\n- Status: Ready to receive transfer\n- Reference: \( {reference}\n- Amount: ₦ \){amountToCharge}`;
+        return `KORAPAY_FALLBACK_INFO: Ready to receive transfer for \( {targetProduct} - Amount: ₦ \){amountToCharge} - Reference: ${reference}`
 
       } catch (koraErr) {
-        console.error('[KORAPAY BACKEND ERROR]:', koraErr.response?.data || koraErr.message);
-        return "We process payments instantly using automated Bank Transfers. Let's try getting those bank account details up again in a moment.";
+        console.error('[KORAPAY BACKEND ERROR]:', koraErr.response?.data || koraErr.message)
+        return "We're having a small issue generating your payment account. Please try again in a moment."
       }
     }
 
@@ -398,15 +397,15 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
         const orderSnap = await db.collectionGroup('orders')
           .where('reference', '==', args.orderId)
           .limit(1)
-          .get();
+          .get()
         
         if (!orderSnap.empty) {
-          const order = orderSnap.docs[0].data();
-          return `ORDER_STATUS:\( {order.status || 'unknown'}| \){order.product || 'N/A'}|${order.amount || 0}`;
+          const order = orderSnap.docs[0].data()
+          return `ORDER_STATUS:\( {order.status || 'unknown'}| \){order.product || 'N/A'}|${order.amount || 0}`
         }
-        return `ORDER_STATUS:NOT_FOUND`;
+        return `ORDER_STATUS:NOT_FOUND`
       } catch (e) {
-        return `Let me check that order status for you.`;
+        return `Let me check that order status for you.`
       }
     }
 
@@ -493,12 +492,12 @@ ${CRITICAL_DIRECTIVES}`
 const getRefinementDirectives = (businessName, currency) => `You are a smooth, persuasive AI Sales Assistant for ${businessName}.
 
 **CRITICAL OPERATIONAL DIRECTIVES:**
-1. Answer the customer's request conversationally using the database data provided above.
-2. Format all prices matching the profile's preferred currency system: "${currency}".
-3. If the data contains RAW_KORAPAY_RESPONSE, carefully extract bank details (Bank Name, Account Number, Account Name, Amount, Reference, Expiry) and present them naturally.
-4. For PRODUCT_LIST or PRODUCT_INFO, format cleanly with full product names.
-5. Always include friendly urgency for payments (e.g. expires in 20 minutes).
-6. Do NOT output raw JSON, code, or tags. Keep responses natural and WhatsApp-friendly.`
+1. Use only the data provided in "Database Response".
+2. For PRODUCT_LIST: Format as clean numbered list with **bold** product names and proper prices.
+3. For PRODUCT_INFO: Present details naturally with **bold** for name and price.
+4. For RAW_KORAPAY_RESPONSE: Extract bank details cleanly. Use **bold** for important info. Mention expiry.
+5. NEVER output raw JSON, code, or tags. Make every response warm, human and WhatsApp-friendly.
+6. Use ** for bold formatting where appropriate.`
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
@@ -560,7 +559,7 @@ async function sendReplyViaGateway(userId, jid, replyText) {
 // ========================
 async function notifyPaymentSuccess(businessId, phoneNumber, orderData) {
   try {
-    const message = `✅ Payment received successfully!\n\n` +
+    const message = `✅ **Payment received successfully!**\n\n` +
                    `Product: ${orderData.product || 'Your Order'}\n` +
                    `Amount: ₦${orderData.amount}\n` +
                    `Reference: ${orderData.reference}\n\n` +
@@ -619,7 +618,7 @@ app.post('/webhook', async (req, res) => {
 
     if (aiResult.type === 'tool_call') {
       console.log('[WEBHOOK] 🔧 AI called tool:', aiResult.tool.function.name)
-      const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products || [])
+      const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products || [], context)
 
       console.log('[WEBHOOK] 🔄 Re-routing tool data to AI for natural language synthesis...')
 
@@ -635,18 +634,12 @@ app.post('/webhook', async (req, res) => {
           {
             model: userModel,
             messages: [
-              {
-                role: 'system',
-                content: refinementPrompt,
-              },
+              { role: 'system', content: refinementPrompt },
               ...history.slice(-8).map((m) => ({
                 role: m.role === 'user' ? 'user' : 'assistant',
                 content: m.text,
               })),
-              {
-                role: 'user',
-                content: text,
-              },
+              { role: 'user', content: text },
             ],
             temperature: 0.7,
             max_tokens: 500,
@@ -662,7 +655,6 @@ app.post('/webhook', async (req, res) => {
         )
 
         replyText = refinedResponse.data.choices[0]?.message?.content?.trim() || ERROR_MESSAGES.toolExecution
-        console.log('[WEBHOOK] ✅ Refined response:', replyText.substring(0, 100))
       } catch (refineErr) {
         console.error('[WEBHOOK] ⚠️ Refinement error:', refineErr.message)
         replyText = toolResult.replace(/RAW_KORAPAY_RESPONSE:|PRODUCT_LIST:|PRODUCT_INFO:|ORDER_/g, '').trim()
@@ -756,6 +748,7 @@ app.post('/korapay-webhook', async (req, res) => {
               rawWebhookPayload: body,
               paidAt: Date.now()
             })
+
             await notifyPaymentSuccess(doc.ref.parent.parent.id, orderData.phoneNumber, orderData)
           }
         }
@@ -768,9 +761,6 @@ app.post('/korapay-webhook', async (req, res) => {
     } 
     else if (reference.startsWith('PRODB-') || reference.includes('productb')) {
       await forwardToProduct(PRODUCT_B_WEBHOOK, body)
-    } 
-    else {
-      await forwardToProduct(PRODUCT_A_WEBHOOK, body)
     }
   })
 })
