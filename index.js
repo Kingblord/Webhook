@@ -104,7 +104,7 @@ async function getBusinessContext(businessId) {
         products
           .map((p) => {
             const negotiable = p.negotiationEnabled ? ' [Negotiable]' : ''
-            return `- \( {p.name} ( \){p.price})${negotiable}: ${p.description || ''}`
+            return `- ${p.name} (${p.price})${negotiable}: ${p.description || ''}`
           })
           .join('\n')
     }
@@ -279,13 +279,13 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
       if (!products || products.length === 0) return ERROR_MESSAGES.productNotFound
 
       return (
-        'PRODUCT_LIST:' +
+        'PRODUCT_LIST:\n' +
         products
           .map((p, index) => {
             const name = (p.name || `Product ${index + 1}`).trim();
             const price = p.price ? `₦${parseFloat(p.price).toLocaleString()}` : 'Price on request';
             const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
-            return `\( {index + 1}. ** \){name}** - \( {price} \){negotiable}`;
+            return `${index + 1}. **${name}** - ${price}${negotiable}`;
           })
           .join('\n') +
         '\n\nWhich one are you interested in?'
@@ -308,7 +308,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     }
 
     case 'createOrder': {
-      const orderId = `ORD-\( {Date.now()}- \){phoneNumber.slice(-4)}`
+      const orderId = `ORD-${Date.now()}-${phoneNumber.slice(-4)}`
       try {
         await db.collection('businesses').doc(businessId).collection('orders').doc(orderId).set({
           orderId,
@@ -320,7 +320,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           status: 'draft',
           createdAt: Date.now()
         })
-        return `ORDER_CREATED:\( {orderId}: \){args.productName}`
+        return `ORDER_CREATED:${orderId}: ${args.productName}`
       } catch (e) {
         console.error('[TOOL] Order creation failed:', e.message)
         return ERROR_MESSAGES.orderCreation
@@ -329,7 +329,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 
     case 'getPaymentDetails': {
       try {
-        const reference = `REF-\( {Date.now()}- \){phoneNumber.slice(-4)}`
+        const reference = `REF-${Date.now()}-${phoneNumber.slice(-4)}`
         const amountToCharge = parseFloat(args.agreedPrice) || 0
         const targetProduct = args.productName || 'Order Transaction'
         const customerName = args.customerName || 'WhatsApp Client'
@@ -340,7 +340,8 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 
         console.log(`[KORAPAY] Creating dynamic account for ${reference}, amount: ${amountToCharge}`)
 
-        const koraResponse = await axios.post(`https://checkout.korapay.com/?type=payment-link`, {
+        // Updated to execute actual Korapay Virtual Bank Account Engine structure
+        const koraResponse = await axios.post(`https://api.korapay.com/v1/charges/bank-transfer`, {
           amount: amountToCharge,
           reference: reference,
           currency: 'NGN',
@@ -349,10 +350,10 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
             name: customerName,
             email: `${phoneNumber}@aromsg.app`
           },
-          merchant_bears_cost: false,
-          channels: ['bank_transfer']
+          merchant_bears_cost: false
         }, {
           headers: { 
+            'Authorization': `Bearer ${KORA_SECRET_KEY}`,
             'accept': 'application/json',
             'content-type': 'application/json'
           },
@@ -361,7 +362,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 
         const koraData = koraResponse.data
 
-        if (koraData && koraData.success && koraData.data?.bank_account_number) {
+        if (koraData && koraData.status === true && koraData.data?.bank_account_number) {
           await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
             reference,
             phoneNumber,
@@ -375,7 +376,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           })
 
           return `RAW_KORAPAY_RESPONSE:${JSON.stringify({
-            success: koraData.success,
+            success: koraData.status,
             data: koraData.data,
             reference: reference,
             amount: amountToCharge,
@@ -384,7 +385,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           })}`
         }
         
-        return `KORAPAY_FALLBACK_INFO: Ready to receive transfer for \( {targetProduct} - Amount: ₦ \){amountToCharge} - Reference: ${reference}`
+        return `KORAPAY_FALLBACK_INFO: Ready to receive transfer for ${targetProduct} - Amount: ₦${amountToCharge} - Reference: ${reference}`
 
       } catch (koraErr) {
         console.error('[KORAPAY BACKEND ERROR]:', koraErr.response?.data || koraErr.message)
@@ -401,7 +402,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         
         if (!orderSnap.empty) {
           const order = orderSnap.docs[0].data()
-          return `ORDER_STATUS:\( {order.status || 'unknown'}| \){order.product || 'N/A'}|${order.amount || 0}`
+          return `ORDER_STATUS:${order.status || 'unknown'}|${order.product || 'N/A'}|${order.amount || 0}`
         }
         return `ORDER_STATUS:NOT_FOUND`
       } catch (e) {
