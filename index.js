@@ -100,11 +100,12 @@ async function getBusinessContext(businessId) {
     let productsContext = ''
     if (products.length > 0) {
       productsContext =
-        '\n\nAvailable Products:\n' +
+        '\nAvailable Products, Base Display Prices, and Floor Limits:\n' +
         products
           .map((p) => {
-            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : ''
-            return `- ${p.name} (${p.price})${negotiable}: ${p.description || ''}`
+            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : ' [Fixed Price Only]'
+            const minPrice = p.minPrice || p.floorPrice || (p.price * 0.85)
+            return `- Name: ${p.name} | Display Price: ₦${p.price}${negotiable} | Absolute Minimum Internal Floor Price Allowed: ₦${minPrice} | Description: ${p.description || 'None'}`
           })
           .join('\n')
     }
@@ -198,13 +199,12 @@ const AI_TOOLS = [
 // CRITICAL OPERATIONAL DIRECTIVES
 // ========================
 const CRITICAL_DIRECTIVES = `
-**CRITICAL OPERATIONAL DIRECTIVES:**
-1. First, think step by step about the user's intent.
-2. Decide if you need to use a tool to extract structured product data or take action.
-3. Use tools when the user asks about products, pricing, availability, orders, or when they are ready to make a payment.
-4. When a tool returns data, do NOT show raw brackets or code syntax to the user.
-5. Never reveal any internal floor/minimum prices — only show the displayed price.
-6. Be concise, persuasive, and natural in your final reply. Never make up product info.
+**CRITICAL OPERATIONAL & WHATSAPP CHAT DIRECTIVES:**
+1. Keep replies extremely short, human, and conversational. Speak like a real person handling chats on WhatsApp, not an AI engine. Maximum 1-2 concise sentences per response unless outputting a product catalog.
+2. NEVVER use raw code syntax or brackets.
+3. NEVER use bold asterisks (**) everywhere. ONLY use bold formatting sparingly around product names when delivering an itemized list. Never use it in normal chat conversation text.
+4. NEGOTIATION POLICY: You have access to the absolute minimum floor prices in the inventory data below. If a user offers below the Display Price but above or equal to the Internal Floor Price, you can accept their offer directly and push for the checkout! If they offer below the absolute minimum floor price, politely reject the price, explain that it's too low, and offer a counter-price right around your floor limit to secure the deal. Do not say you need to check or reach out to anyone—you are empowered to make the deal right now.
+5. If the user accepts a price or is ready to purchase, call createOrder or getPaymentDetails tool immediately to generate their checkout account details.
 `
 
 // ========================
@@ -340,7 +340,6 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 
         console.log(`[KORAPAY] Creating dynamic account for ${reference}, amount: ${amountToCharge}`)
 
-        // Updated to execute actual Korapay Virtual Bank Account Engine structure
         const koraResponse = await axios.post(`https://api.korapay.com/v1/charges/bank-transfer`, {
           amount: amountToCharge,
           reference: reference,
@@ -422,9 +421,9 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 async function getAIResponse(businessName, personality, productsContext, history, userMessage, userModel = null) {
   const model = userModel || OPENROUTER_MODEL
   
-  const systemPrompt = `You are a smart AI Sales Assistant for ${businessName}.
+  const systemPrompt = `You are a smooth, humanized AI Sales Representative for ${businessName}.
 
-${personality || 'You are friendly, professional, and focused on helping customers.'}
+${personality || 'You are friendly, local, witty, and focused on helping closing sales on WhatsApp.'}
 
 Current Business Inventory & Context:
 """
@@ -450,7 +449,7 @@ ${CRITICAL_DIRECTIVES}`
         ],
         tools: AI_TOOLS,
         tool_choice: 'auto',
-        temperature: 0.68,
+        temperature: 0.65,
         max_tokens: 850,
       },
       {
@@ -490,15 +489,13 @@ ${CRITICAL_DIRECTIVES}`
 // ========================
 // GET REFINEMENT DIRECTIVES
 // ========================
-const getRefinementDirectives = (businessName, currency) => `You are a smooth, persuasive AI Sales Assistant for ${businessName}.
+const getRefinementDirectives = (businessName, currency) => `You are an incredibly smooth, concise WhatsApp vendor for ${businessName}.
 
-**CRITICAL OPERATIONAL DIRECTIVES:**
-1. Use only the data provided in "Database Response".
-2. For PRODUCT_LIST: Format as clean numbered list with **bold** product names and proper prices.
-3. For PRODUCT_INFO: Present details naturally with **bold** for name and price.
-4. For RAW_KORAPAY_RESPONSE: Extract bank details cleanly. Use **bold** for important info. Mention expiry.
-5. NEVER output raw JSON, code, or tags. Make every response warm, human and WhatsApp-friendly.
-6. Use ** for bold formatting where appropriate.`
+**CRITICAL STYLE RULES:**
+1. Keep the message to exactly 1 or 2 conversational lines.
+2. Absolutely DO NOT include code syntax, brackets, JSON text, or tags.
+3. NEVER use bold markdown tag structures (**) unless you are presenting a clean product itemization list. Keep sentences clean and plain text.
+4. Process data context explicitly from the Database Response block.`
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
@@ -560,7 +557,7 @@ async function sendReplyViaGateway(userId, jid, replyText) {
 // ========================
 async function notifyPaymentSuccess(businessId, phoneNumber, orderData) {
   try {
-    const message = `✅ **Payment received successfully!**\n\n` +
+    const message = `✅ *Payment received successfully!*\n\n` +
                    `Product: ${orderData.product || 'Your Order'}\n` +
                    `Amount: ₦${orderData.amount}\n` +
                    `Reference: ${orderData.reference}\n\n` +
@@ -642,7 +639,7 @@ app.post('/webhook', async (req, res) => {
               })),
               { role: 'user', content: text },
             ],
-            temperature: 0.7,
+            temperature: 0.5,
             max_tokens: 500,
           },
           {
