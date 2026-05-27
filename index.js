@@ -225,7 +225,7 @@ const ERROR_MESSAGES = {
 }
 
 // ========================
-// TOOL EXECUTION LAYER (Enhanced)
+// TOOL EXECUTION LAYER
 // ========================
 async function executeTool(toolCall, businessId, phoneNumber, products = [], context = {}) {
   const { name, arguments: argsStr } = toolCall.function
@@ -242,12 +242,15 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     case 'getProductList': {
       if (!products || products.length === 0) return ERROR_MESSAGES.productNotFound
 
+      // Improved product list formatting - ensure clean names
       return (
         'PRODUCT_LIST:' +
         products
-          .map((p) => {
-            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : ''
-            return `• \( {p.name} ( \){p.price})${negotiable}`
+          .map((p, index) => {
+            const name = p.name?.trim() || `Product ${index + 1}`;
+            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
+            const price = p.price ? `₦${parseFloat(p.price).toLocaleString()}` : 'Price on request';
+            return `${index + 1}. ${name} - \( {price} \){negotiable}`;
           })
           .join('\n') +
         '\n\nWhich one are you interested in?'
@@ -255,20 +258,23 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     }
 
     case 'getProductInfo': {
-      const productNameArg = args.productName || ''
-      const product = products.find((p) =>
-        p.name.toLowerCase().includes(productNameArg.toLowerCase())
-      ) || products.find((p) => 
-        (p.description || '').toLowerCase().includes(productNameArg.toLowerCase())
-      )
+      const productNameArg = (args.productName || '').toLowerCase().trim();
+      let product = products.find((p) =>
+        (p.name || '').toLowerCase().includes(productNameArg)
+      );
+
+      if (!product) {
+        product = products.find((p) => 
+          (p.description || '').toLowerCase().includes(productNameArg)
+        );
+      }
 
       if (product) {
-        const status = product.negotiationEnabled ? 'Negotiable' : 'Fixed price'
         return `PRODUCT_INFO:${JSON.stringify({
           name: product.name,
           price: product.price,
           description: product.description || 'No description provided.',
-          status
+          negotiationEnabled: product.negotiationEnabled
         })}`
       }
       return ERROR_MESSAGES.productNotFound
@@ -329,7 +335,6 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         const koraData = koraResponse.data
 
         if (koraData && koraData.success && koraData.data?.bank_account_number) {
-          // Store enhanced pending order
           await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
             reference,
             phoneNumber,
@@ -338,24 +343,25 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
             customerName,
             status: 'pending',
             createdAt: Date.now(),
-            orderLinked: true
+            orderLinked: true,
+            koraRawResponse: koraData
           })
 
-          return `KORAPAY_ACCOUNT_INFO:\n` +
-                 `- Bank Name: ${koraData.data.bank_name || 'Korapay Partner Bank'}\n` +
-                 `- Account Number: ${koraData.data.bank_account_number}\n` +
-                 `- Account Name: ${koraData.data.bank_account_name || 'AroMsg Order Payment'}\n` +
-                 `- Amount: ₦${amountToCharge}\n` +
-                 `- Expiry: This temporary transfer details expires in 20 minutes.\n` +
-                 `- Reference: ${reference}\n` +
-                 `- Product: ${targetProduct}`
+          return `RAW_KORAPAY_RESPONSE:${JSON.stringify({
+            success: koraData.success,
+            data: koraData.data,
+            reference: reference,
+            amount: amountToCharge,
+            product: targetProduct,
+            expiryMinutes: 20
+          })}`
         }
         
-        return `KORAPAY_FALLBACK_INFO:\n- Status: Ready to receive transfer\n- Reference: \( {reference}\n- Amount: ₦ \){amountToCharge}`
+        return `KORAPAY_FALLBACK_INFO: Ready to receive transfer for \( {targetProduct} - Amount: ₦ \){amountToCharge} - Reference: ${reference}`
 
       } catch (koraErr) {
         console.error('[KORAPAY BACKEND ERROR]:', koraErr.response?.data || koraErr.message)
-        return "We're having a small issue generating your payment account. Please try again in a moment or tell me the product again."
+        return "We're having a small issue generating your payment account. Please try again in a moment."
       }
     }
 
@@ -454,18 +460,18 @@ ${CRITICAL_DIRECTIVES}`
 }
 
 // ========================
-// GET REFINEMENT DIRECTIVES (Improved)
+// GET REFINEMENT DIRECTIVES
 // ========================
 const getRefinementDirectives = (businessName, currency) => `You are a smooth, persuasive AI Sales Assistant for ${businessName}.
 
 **CRITICAL OPERATIONAL DIRECTIVES:**
 1. Answer the customer's request conversationally using the database data provided above.
 2. Format all prices matching the profile's preferred currency system: "${currency}".
-3. If the data contains KORAPAY_ACCOUNT_INFO, extract Bank Name, Account Number, Account Name, Amount, Reference and Expiry. Present them cleanly in a natural message.
-4. Always include a friendly urgency note about the 20-minute expiry.
-5. For ORDER_CREATED or ORDER_STATUS data, respond naturally and guide the customer to the next step.
-6. NEVER output raw data, JSON, or code-like text. Make it warm, professional and short for WhatsApp.
-7. End with a clear call-to-action when appropriate.`
+3. If the data contains RAW_KORAPAY_RESPONSE, carefully extract Bank Name, Account Number, Account Name, Amount, Reference and Expiry from the data object. Present them naturally.
+4. For PRODUCT_LIST data, format it as a clean numbered list with proper product names.
+5. Always mention expiry time for payments and add friendly urgency.
+6. NEVER output raw JSON, code, or technical tags. Make every response warm, professional and WhatsApp-friendly.
+7. Keep messages concise.`
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
@@ -632,7 +638,7 @@ app.post('/webhook', async (req, res) => {
         console.log('[WEBHOOK] ✅ Refined response:', replyText.substring(0, 100))
       } catch (refineErr) {
         console.error('[WEBHOOK] ⚠️ Refinement error:', refineErr.message)
-        replyText = toolResult.replace(/KORAPAY_ACCOUNT_INFO:|PRODUCT_|ORDER_/g, '')
+        replyText = toolResult.replace(/RAW_KORAPAY_RESPONSE:|PRODUCT_LIST:|PRODUCT_INFO:|ORDER_/g, '').trim()
       }
     } else {
       replyText = aiResult.content
@@ -659,7 +665,7 @@ app.post('/webhook', async (req, res) => {
 })
 
 // ========================
-// KORAPAY WEBHOOK (Enhanced with Customer Notification)
+// KORAPAY WEBHOOK
 // ========================
 function verifyKoraSignature(body, signature) {
   if (!signature || !KORA_SECRET_KEY) return false
@@ -724,7 +730,6 @@ app.post('/korapay-webhook', async (req, res) => {
               paidAt: Date.now()
             })
 
-            // Send success notification to customer
             await notifyPaymentSuccess(doc.ref.parent.parent.id, orderData.phoneNumber, orderData)
             
             console.log(`[KORA-WEBHOOK] ✅ Order updated and customer notified for ${reference}`)
