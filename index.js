@@ -2,6 +2,7 @@ const express = require('express')
 const dotenv = require('dotenv')
 const axios = require('axios')
 const admin = require('firebase-admin')
+const crypto = require('crypto')
 const { jidNormalizedUser } = require('@whiskeysockets/baileys')
 
 dotenv.config()
@@ -21,14 +22,10 @@ const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp'
 const PORT = process.env.PORT || 3000
 
-if (!FIREBASE_PROJECT_ID || !FIREBASE_PRIVATE_KEY || !FIREBASE_CLIENT_EMAIL) {
-  console.error('❌ Firebase credentials missing')
-  process.exit(1)
-}
-
-if (!OPENROUTER_API_KEY) {
-  console.warn('⚠️ OPENROUTER_API_KEY is not set')
-}
+// Korapay Specific Environment Variables
+const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY // sk_live_xxxxx or sk_test_xxxxx
+const PRODUCT_A_WEBHOOK = process.env.PRODUCT_A_WEBHOOK_URL
+const PRODUCT_B_WEBHOOK = process.env.PRODUCT_B_WEBHOOK_URL
 
 // ========================
 // FIREBASE INITIALIZATION
@@ -128,7 +125,6 @@ async function getBusinessContext(businessId) {
 // ========================
 // TOOL DEFINITIONS FOR AI
 // ========================
-
 const AI_TOOLS = [
   {
     type: 'function',
@@ -170,8 +166,15 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'getPaymentDetails',
-      description: 'Get payment methods and instructions',
-      parameters: { type: 'object', properties: {}, required: [] },
+      description: 'Get payment methods and instructions or request direct Korapay virtual account to pay immediately',
+      parameters: {
+        type: 'object',
+        properties: {
+          productName: { type: 'string', description: 'The name of the product being purchased' },
+          agreedPrice: { type: 'number', description: 'The final total price agreed upon for the transaction' }
+        },
+        required: ['productName', 'agreedPrice']
+      },
     },
   },
   {
@@ -191,12 +194,11 @@ const AI_TOOLS = [
 // ========================
 // CRITICAL OPERATIONAL DIRECTIVES
 // ========================
-
 const CRITICAL_DIRECTIVES = `
 **CRITICAL OPERATIONAL DIRECTIVES:**
 1. First, think step by step about the user's intent.
-2. Decide if you need to use a tool to extract structured product data or take action (like checking/creating orders).
-3. Use tools when the user asks about products, pricing, availability, or orders.
+2. Decide if you need to use a tool to extract structured product data or take action (like checking/creating orders or generating custom checkout data).
+3. Use tools when the user asks about products, pricing, availability, orders, or when they are ready to make a payment.
 4. When a tool returns data, do NOT show raw brackets or code syntax to the user. Instead, process that information and respond like a natural, smooth, empathetic human salesperson.
 5. If an item is marked as negotiable, do not just state 'it is negotiable'. Engage the user conversationally (e.g., ask for their target budget or offer a minor concession to close the sale).
 6. Be concise, persuasive, and natural in your final reply. Never make up product info.
@@ -205,7 +207,6 @@ const CRITICAL_DIRECTIVES = `
 // ========================
 // ERROR MESSAGES
 // ========================
-
 const ERROR_MESSAGES = {
   generic: "Sorry, I'm having trouble right now. Please try again.",
   aiGeneration: "I'm processing your request right now. Please give me a moment.",
@@ -223,7 +224,6 @@ const ERROR_MESSAGES = {
 // ========================
 // TOOL EXECUTION LAYER
 // ========================
-
 async function executeTool(toolCall, businessId, phoneNumber, products = []) {
   const { name, arguments: argsStr } = toolCall.function
   const args = JSON.parse(argsStr || '{}')
@@ -265,7 +265,68 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
     }
 
     case 'getPaymentDetails': {
-      return 'We accept Bank Transfer, USSD, and Card payments.\nWould you like our account details?'
+      try {
+        const reference = `REF-${Date.now()}-${phoneNumber.slice(-4)}`;
+        const amountToCharge = args.agreedPrice || 0;
+        const targetProduct = args.productName || 'Order Transaction';
+
+        if (amountToCharge <= 0) {
+          return "We accept bank transfers via automated checkout options. Could you confirm the item you want so I can pull up account information?";
+        }
+
+        console.log(`[KORAPAY] Initializing dynamic checkout parameters for reference: ${reference}, amount: ${amountToCharge}`);
+        
+        const koraResponse = await axios.post(`https://checkout.korapay.com/?type=payment-link`, {
+          amount: parseFloat(amountToCharge),
+          reference: reference,
+          currency: 'NGN',
+          notification_url: 'https://aromsg.up.railway.app/korapay-webhook',
+          customer: {
+            name: `WhatsApp Client`,
+            email: `${phoneNumber}@aromsg.app`
+          },
+          merchant_bears_cost: false,
+          channels: ['bank_transfer']
+        }, {
+          headers: { 
+            'accept': 'application/json',
+            'content-type': 'application/json'
+          },
+          timeout: 12000
+        });
+
+        const koraData = koraResponse.data;
+
+        if (koraData && koraData.success && koraData.data?.bank_account_number) {
+          // Store pending transaction parameters inside Firestore
+          await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
+            reference,
+            phoneNumber,
+            amount: amountToCharge,
+            product: targetProduct,
+            status: 'pending',
+            createdAt: Date.now()
+          });
+
+          return `KORAPAY_ACCOUNT_INFO:\n` +
+                 `- Bank Name: ${koraData.data.bank_name || 'Korapay Partner Bank'}\n` +
+                 `- Account Number: ${koraData.data.bank_account_number}\n` +
+                 `- Account Name: ${koraData.data.bank_account_name || 'AroMsg Order Payment'}\n` +
+                 `- Amount: ₦${amountToCharge}\n` +
+                 `- Expiry: This temporary transfer details expires in 20 minutes.\n` +
+                 `- Reference: ${reference}`;
+        }
+        
+        return `KORAPAY_FALLBACK_INFO:\n` +
+               `- Status: Ready to receive transfer\n` +
+               `- Reference: ${reference}\n` +
+               `- Amount: ₦${amountToCharge}\n` +
+               `- Instruction: Please proceed to confirm your transfer request. An automated confirmation will follow.`;
+
+      } catch (koraErr) {
+        console.error('[KORAPAY BACKEND ERROR]:', koraErr.response?.data || koraErr.message);
+        return "We process payments instantly using automated Bank Transfers. Let's try getting those bank account details up again in a moment.";
+      }
     }
 
     case 'checkOrderStatus': {
@@ -281,7 +342,6 @@ async function executeTool(toolCall, businessId, phoneNumber, products = []) {
 // ========================
 // AI RESPONSE WITH TOOL SUPPORT
 // ========================
-
 async function getAIResponse(businessName, personality, productsContext, history, userMessage, userModel = null) {
   const model = userModel || OPENROUTER_MODEL
   
@@ -353,21 +413,19 @@ ${CRITICAL_DIRECTIVES}`
 // ========================
 // GET REFINEMENT DIRECTIVES
 // ========================
-
 const getRefinementDirectives = (businessName, currency) => `You are a smooth, persuasive AI Sales Assistant for ${businessName}.
 
 **CRITICAL OPERATIONAL DIRECTIVES:**
 1. Answer the customer's request conversationally using the database data provided above.
-2. Format all prices matching the profile's preferred currency system: "${currency}". (e.g., If NGN use ₦, if USD use $, if EUR use €, etc.)
-3. If the item status shows it is negotiable, handle it gracefully like a master human negotiator. Ask for their target price range or extend a polite opening offer to secure the order.
-4. Do NOT output raw variable templates, code blocks, or JavaScript structural braces to the customer.
-5. Keep your response concise, friendly, and structured perfectly for a short WhatsApp chat message.
+2. Format all prices matching the profile's preferred currency system: "${currency}". (Currency is always in Naira NGN unless explicitly configured).
+3. If the data contains Korapay Bank Account Information (Bank Name, Account Number, Expiry), extract those details and write a highly natural, helpful text response. Do NOT provide or share links; give them the exact Account details directly in the chat text block.
+4. Explicitly include a friendly statement informing them of how long they have left to transfer the money (e.g., "This temporary account expires in 20 minutes, so let me know as soon as you make the transfer!").
+5. Do NOT output raw variable templates, code blocks, or JavaScript structural braces to the customer. Keep your response concise, human, and structured perfectly for a short WhatsApp chat message.
 `
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
 // ========================
-
 async function saveMessage(businessId, phoneNumber, role, text, messageId) {
   try {
     const timestamp = Date.now()
@@ -423,7 +481,6 @@ async function sendReplyViaGateway(userId, jid, replyText) {
 // ========================
 // MAIN WEBHOOK
 // ========================
-
 app.post('/webhook', async (req, res) => {
   try {
     const authHeader = req.headers.authorization
@@ -441,7 +498,6 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`[WEBHOOK] 📨 Message from ${phoneNumber}: ${text.substring(0, 70)}...`)
 
-    // Get business context and user settings
     const context = await getBusinessContext(userId)
     if (!context) {
       return res.status(404).json({ success: false, error: 'Business not found' })
@@ -452,10 +508,8 @@ app.post('/webhook', async (req, res) => {
     const userModel = businessData.openrouterModel || OPENROUTER_MODEL
     const userCurrency = businessData.currency || 'NGN'
 
-    // Get conversation history
     const history = await getConversationHistory(userId, phoneNumber)
 
-    // Generate AI response with tool support
     console.log('[WEBHOOK] 🤖 Generating AI response with model:', userModel)
     const aiResult = await getAIResponse(
       context.businessName,
@@ -468,7 +522,6 @@ app.post('/webhook', async (req, res) => {
 
     let replyText
 
-    // Handle tool calls
     if (aiResult.type === 'tool_call') {
       console.log('[WEBHOOK] 🔧 AI called tool:', aiResult.tool.function.name)
       const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products || [])
@@ -523,7 +576,6 @@ app.post('/webhook', async (req, res) => {
       replyText = aiResult.content
     }
 
-    // Save messages and send reply
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
     await sendReplyViaGateway(userId, normalizedFrom, replyText)
@@ -544,6 +596,99 @@ app.post('/webhook', async (req, res) => {
   }
 })
 
+// ========================
+// NEW KORAPAY WEBHOOK ROUTER (Express Port)
+// ========================
+function verifyKoraSignature(body, signature) {
+  if (!signature || !KORA_SECRET_KEY) return false
+
+  try {
+    const hash = crypto
+      .createHmac('sha256', KORA_SECRET_KEY)
+      .update(JSON.stringify(body.data))
+      .digest('hex')
+
+    return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature))
+  } catch (error) {
+    console.error('Signature verification error:', error)
+    return false
+  }
+}
+
+async function forwardToProduct(productUrl, payload) {
+  try {
+    if (!productUrl) return
+    await axios.post(productUrl, payload, {
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 8000,
+    })
+  } catch (error) {
+    console.error(`Failed to forward to ${productUrl}:`, error.message)
+  }
+}
+
+app.post('/korapay-webhook', async (req, res) => {
+  const signature = req.headers['x-korapay-signature']
+  const body = req.body
+
+  // 1. Verify signature authenticity
+  if (!verifyKoraSignature(body, signature)) {
+    console.warn('Invalid Kora webhook signature received.')
+    return res.status(200).json({ received: true }) // Return 200 to satisfy Kora response requirements
+  }
+
+  // 2. Acknowledge Kora instantly before processing deep logic
+  res.status(200).json({ received: true })
+
+  // 3. Process the routing logic asynchronously
+  setImmediate(async () => {
+    const data = body.data || {}
+    const reference = data.reference || data.payment_reference || data.unique_reference || ''
+
+    console.log(`[KORA-WEBHOOK] 📨 Event: ${body.event}, Reference: ${reference}`)
+
+    // Check if reference matches the WhatsApp Brain order system
+    if (reference.startsWith('REF-')) {
+      console.log(`[KORA-WEBHOOK] Matching reference detected for WhatsApp automated sales system: ${reference}`)
+      
+      try {
+        // Query across business collections to find the matching transaction record
+        const ordersRef = db.collectionGroup('orders').where('reference', '==', reference)
+        const snapshot = await ordersRef.get()
+
+        if (!snapshot.empty) {
+          for (const doc of snapshot.docs) {
+            await doc.ref.update({
+              status: 'success',
+              updatedAt: Date.now(),
+              rawWebhookPayload: body
+            })
+            console.log(`[KORA-WEBHOOK] ✅ Order status updated successfully in Firestore for reference: ${reference}`)
+          }
+        } else {
+          console.warn(`[KORA-WEBHOOK] Reference ${reference} found but no matching order item exists in Firestore.`)
+        }
+      } catch (dbErr) {
+        console.error('[KORA-WEBHOOK] Firestore update failure:', dbErr.message)
+      }
+
+    // Otherwise pass transaction payloads over to your Product A or Product B external services
+    } else if (reference.startsWith('PRODA-') || reference.includes('producta')) {
+      console.log(`[KORA-WEBHOOK] Forwarding payload to Product A endpoint...`)
+      await forwardToProduct(PRODUCT_A_WEBHOOK, body)
+    } else if (reference.startsWith('PRODB-') || reference.includes('productb')) {
+      console.log(`[KORA-WEBHOOK] Forwarding payload to Product B endpoint...`)
+      await forwardToProduct(PRODUCT_B_WEBHOOK, body)
+    } else {
+      console.log('[KORA-WEBHOOK] Unknown reference prefix pattern. Routing to Product A as global fallback...')
+      await forwardToProduct(PRODUCT_A_WEBHOOK, body)
+    }
+  })
+})
+
+// ========================
+// HEALTH & INITIALIZATION
+// ========================
 app.get('/health', (req, res) => {
   res.json({ status: 'healthy', service: 'AroMsg AI Decision Brain' })
 })
