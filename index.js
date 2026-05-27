@@ -22,7 +22,6 @@ const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp'
 const PORT = process.env.PORT || 3000
 
-// Korapay Specific Environment Variables
 const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY
 const PRODUCT_A_WEBHOOK = process.env.PRODUCT_A_WEBHOOK_URL
 const PRODUCT_B_WEBHOOK = process.env.PRODUCT_B_WEBHOOK_URL
@@ -47,16 +46,60 @@ try {
   process.exit(1)
 }
 
-// ========================
-// BAILEYS JID NORMALIZER
-// ========================
 function normalizeJid(jid) {
   if (!jid) return jid
   return jidNormalizedUser(jid)
 }
 
 // ========================
-// GET CONVERSATION HISTORY
+// PERSISTENT FIRESTORE CONTEXT TRACKING
+// ========================
+async function getOrCreateConversationContext(businessId, phoneNumber) {
+  const cleanPhone = phoneNumber.replace(/\D/g, '')
+  const docRef = db.collection('businesses').doc(businessId).collection('contexts').doc(cleanPhone)
+  
+  try {
+    const doc = await docRef.get()
+    if (doc.exists) {
+      const data = doc.data()
+      // If data is older than 45 minutes, clear negotiation round to prevent stale loop traps
+      if (Date.now() - (data.lastInteraction || 0) > 2700000) {
+        return {
+          currentProduct: null,
+          lastPrice: null,
+          negotiationRound: 0,
+          intent: 'browsing'
+        }
+      }
+      return data
+    }
+  } catch (e) {
+    console.error('[CONTEXT DB FETCH ERROR]:', e.message)
+  }
+
+  return {
+    currentProduct: null,
+    lastPrice: null,
+    negotiationRound: 0,
+    intent: 'browsing'
+  }
+}
+
+async function saveConversationContext(businessId, phoneNumber, contextData) {
+  const cleanPhone = phoneNumber.replace(/\D/g, '')
+  const docRef = db.collection('businesses').doc(businessId).collection('contexts').doc(cleanPhone)
+  try {
+    await docRef.set({
+      ...contextData,
+      lastInteraction: Date.now()
+    }, { merge: true })
+  } catch (e) {
+    console.error('[CONTEXT DB SAVE ERROR]:', e.message)
+  }
+}
+
+// ========================
+// HISTORY WITH CONCISE ANALYTICS
 // ========================
 async function getConversationHistory(businessId, phoneNumber, limit = 15) {
   try {
@@ -69,10 +112,18 @@ async function getConversationHistory(businessId, phoneNumber, limit = 15) {
       .limit(limit)
       .get()
 
-    return snapshot.docs.map((doc) => doc.data()).reverse()
+    const messages = snapshot.docs.map((doc) => doc.data()).reverse()
+    const userMessages = messages.filter(m => m.role === 'user')
+    const negotiationCount = messages.filter(m => m.text && (m.text.toLowerCase().includes('k') || m.text.toLowerCase().includes('000'))).length
+
+    return {
+      messages,
+      count: messages.length,
+      isPriceSensitive: negotiationCount > 3
+    }
   } catch (err) {
     console.error('[DB] History fetch error:', err.message)
-    return []
+    return { messages: [], count: 0, isPriceSensitive: false }
   }
 }
 
@@ -83,7 +134,6 @@ async function getBusinessContext(businessId) {
   try {
     const businessDoc = await db.collection('businesses').doc(businessId).get()
     if (!businessDoc.exists) return null
-
     const businessData = businessDoc.data()
 
     const productsSnapshot = await db
@@ -100,13 +150,13 @@ async function getBusinessContext(businessId) {
     let productsContext = ''
     if (products.length > 0) {
       productsContext =
-        '\nINVENTORY DATA:\n' +
+        '\n📦 VERIFIED STORE INVENTORY:\n' +
         products
           .map((p) => {
             const negotiable = p.negotiationEnabled ? 'Yes' : 'No'
             const basePrice = parseFloat(p.price || 0)
             const floorPrice = parseFloat(p.minPrice || p.floorPrice || (basePrice * 0.88))
-            return `- Item: ${p.name}\n  Listed Price: ₦${basePrice.toLocaleString()}\n  Is Negotiable: ${negotiable}\n  CONFIDENTIAL MERCHANDISE FLOOR: ₦${floorPrice.toLocaleString()}\n  Description: ${p.description || 'No custom description available'}`
+            return `• Item Name: ${p.name}\n  Store Price: ₦${basePrice.toLocaleString()}\n  Negotiable: ${negotiable}\n  INTERNAL_PROTECTED_FLOOR: ₦${floorPrice.toLocaleString()}\n  Description: ${p.description || 'Premium Stock'}`
           })
           .join('\n\n')
     }
@@ -126,14 +176,14 @@ async function getBusinessContext(businessId) {
 }
 
 // ========================
-// TOOL DEFINITIONS FOR AI
+// SECURE AI TOOLS STRUCT
 // ========================
 const AI_TOOLS = [
   {
     type: 'function',
     function: {
       name: 'getProductList',
-      description: 'Return list of all available products',
+      description: 'Show list of all available store products.',
       parameters: { type: 'object', properties: {}, required: [] },
     },
   },
@@ -141,7 +191,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'getProductInfo',
-      description: 'Get detailed info about a specific product',
+      description: 'Get deep technical specs or details on a particular item.',
       parameters: {
         type: 'object',
         properties: { productName: { type: 'string' } },
@@ -152,31 +202,29 @@ const AI_TOOLS = [
   {
     type: 'function',
     function: {
-      name: 'createOrder',
-      description: 'Create order when customer is ready to buy',
+      name: 'makeCounterOffer',
+      description: 'Call this ONLY when a customer requests a cheaper price or presents a lower counter offer counter budget. The backend handles strategy calculations.',
       parameters: {
         type: 'object',
         properties: {
-          productName: { type: 'string' },
-          quantity: { type: 'number', default: 1 },
-          customerName: { type: 'string' },
-          agreedPrice: { type: 'number' }
+          productName: { type: 'string', description: 'Exact name of product being negotiated' },
+          customerOffer: { type: 'number', description: 'The absolute raw numeric price offer from user' }
         },
-        required: ['productName'],
+        required: ['productName', 'customerOffer'],
       },
     },
   },
   {
     type: 'function',
     function: {
-      name: 'getPaymentDetails',
-      description: 'Generate dynamic payment credentials using the Korapay bank transfer framework. Run this immediately when the customer accepts an agreed price, asks how to pay, or is ready to check out.',
+      name: 'initiatePayment',
+      description: 'CRITICAL: Run this instantly when the customer accepts an agreed price, says ok/cool/send account, or is ready to make transaction transfers.',
       parameters: {
         type: 'object',
         properties: {
-          productName: { type: 'string', description: 'The name of the product being purchased' },
-          agreedPrice: { type: 'number', description: 'The final total price agreed upon for the transaction' },
-          customerName: { type: 'string', description: 'Customer full name if known' }
+          productName: { type: 'string', description: 'The product being bought' },
+          agreedPrice: { type: 'number', description: 'The dynamic finalized transaction value' },
+          customerName: { type: 'string', description: 'Known client name or leave empty' }
         },
         required: ['productName', 'agreedPrice']
       },
@@ -186,7 +234,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'checkOrderStatus',
-      description: 'Check status of an existing order',
+      description: 'Verify payment or tracking records.',
       parameters: {
         type: 'object',
         properties: { orderId: { type: 'string' } },
@@ -197,518 +245,376 @@ const AI_TOOLS = [
 ]
 
 // ========================
-// CRITICAL OPERATIONAL DIRECTIVES
+// ULTRA-HUMAN NIGERIAN TRADER DIRECTIVES
 // ========================
-const CRITICAL_DIRECTIVES = `
-**CRITICAL OPERATIONAL & WHATSAPP CHAT DIRECTIVES:**
-1. CHAT STYLE: Speak exactly like a local, professional, real human merchant on WhatsApp. Keep messages ultra-short and precise (1-2 sentences max). 
-2. NO MARKDOWN ABUSE: Never put bold asterisks (**) on regular text phrases or sentences. Only use bold formatting inside structural catalogs or list outputs.
-3. REALISTIC NEGOTIATION RULES: 
-   - Never reveal or blurt out the 'CONFIDENTIAL MERCHANDISE FLOOR'.
-   - If the customer counters with a very low price (e.g., offering 600k for a 1.3M item), do NOT drop immediately to your minimum floor price. Instead, negotiate like a real person trying to keep margins high! Drop the price slightly (e.g., try 1.15M or 1.1M first). Counter-offer step by step. Only use the floor price as your absolute final shield line if they push hard.
-   - If a customer makes an offer that is strictly equal to or above the 'CONFIDENTIAL MERCHANDISE FLOOR', you can choose to accept it gracefully to close the deal fast.
-4. MANDATORY PAYMENT TOOL TRIGGER: When a customer says "how can I pay", accepts a counter-price, or says an offer is cool, you MUST immediately call the 'getPaymentDetails' tool. Never write fake account details, fake bank names, or placeholders. You do not have manual bank accounts; you depend completely on the tool execution layer to give you real data.
+const MASTER_DIRECTIVES = `
+🎯 PERSONALITY DESIGN: YOU ARE A HUMAN NIGERIAN VENDOR TRADING ON WHATSAPP.
+- Keep chats short (1-2 sentences absolute max). Avoid automated blocks of texts.
+- Use natural, current urban Nigerian/Lagos trading phrases: "How far?", "Omo, that amount low o", "Make we do business na", "I dey online, data active", "Sharp sharp".
+- BANNED: Never use raw markdown asterisks (**) across common messages. No brackets, no code text logs.
+
+🔒 STRATEGIC BARGAINING RULES:
+- Never say "Internal protected floor" or reveal bottom metrics.
+- If a client bids drastically low, do NOT break or dump down to your lowest floor limits instantly. Step down gradually: Drop roughly 8% in Round 1, 12% in Round 2, and approach floor metrics only during desperate Round 3 push efforts.
+- If their offer cleanly hits or matches above your internal protected metrics floor, lock the deal immediately and move directly to checking out.
+
+⚡ INSTANT PAYMENT PROTOCOL:
+- When the deal lands or the user gives explicit greenlights ("send account", "how can I pay", "cool", "I will pay"), you MUST call 'initiatePayment' tool instantly. Never fabricate fake banks, transfer tables, or placeholder digits.
 `
 
-// ========================
-// ERROR MESSAGES
-// ========================
-const ERROR_MESSAGES = {
-  generic: "Sorry, I'm having trouble right now. Please try again.",
-  aiGeneration: "I'm processing your request right now. Please give me a moment.",
-  toolExecution: 'Let me process that information for you.',
-  orderCreation: 'I\'m having trouble creating your order. Please try again or contact support.',
-  paymentDetails: "I'll get you our payment details. One moment please.",
-  orderStatus: 'Let me check that order status for you.',
-  productNotFound: "I couldn't find that product. Would you like to see what we have available?",
-  inventory: "I'm checking our inventory for you.",
-  delivery: "I'll help you schedule delivery. Let me get that set up.",
-  promo: "I'll verify that promo code for you.",
-  negotiation: "Great! Let's work out a deal. What budget did you have in mind?",
+function findBestProductMatch(query, products) {
+  if (!query || !products.length) return null
+  query = query.toLowerCase().trim()
+  let bestMatch = null
+  let highestScore = 0
+
+  for (const product of products) {
+    const name = (product.name || '').toLowerCase()
+    let score = 0
+    if (name === query) score = 1.0
+    else if (name.includes(query) || query.includes(name)) score = 0.85
+    if (score > highestScore) {
+      highestScore = score
+      bestMatch = product
+    }
+  }
+  return highestScore > 0.4 ? bestMatch : null
 }
 
 // ========================
-// FUZZY PRODUCT MATCHING
+// RE-ENGINEERED NEGOTIATION MATRIX
 // ========================
-function findBestProductMatch(query, products) {
-  if (!query || !products.length) return null;
-  query = query.toLowerCase().trim();
-
-  let bestMatch = null;
-  let highestScore = 0;
-
-  for (const product of products) {
-    const name = (product.name || '').toLowerCase();
-    const desc = (product.description || '').toLowerCase();
-    
-    let score = 0;
-    
-    if (name.includes(query) || query.includes(name.split(' ').slice(0, 3).join(' '))) {
-      score = 0.95;
-    } else {
-      const queryWords = query.split(/\s+/);
-      const nameWords = name.split(/\s+/);
-      let matches = queryWords.filter(qw => 
-        nameWords.some(nw => nw.includes(qw) || qw.includes(nw))
-      ).length;
-      score = matches / Math.max(queryWords.length, 1);
-    }
-
-    if (score > highestScore) {
-      highestScore = score;
-      bestMatch = product;
+function calculateCounterOffer(customerOffer, listPrice, floorPrice, round) {
+  if (customerOffer >= floorPrice) {
+    return {
+      price: customerOffer,
+      strategy: 'accept',
+      message: 'Deal locked! Let me get your invoice'
     }
   }
 
-  return highestScore > 0.45 ? bestMatch : null;
+  if (round <= 1) {
+    const targetPrice = Math.max(listPrice * 0.91, floorPrice * 1.12)
+    return {
+      price: Math.round(targetPrice),
+      strategy: 'round_1_hold',
+      message: `Abeg that one low o. Let's do ₦${Math.round(targetPrice).toLocaleString()}`
+    }
+  } else if (round === 2) {
+    const targetPrice = Math.max(listPrice * 0.85, floorPrice * 1.05)
+    return {
+      price: Math.round(targetPrice),
+      strategy: 'round_2_push',
+      message: `Last offer make we run am sharp sharp: ₦${Math.round(targetPrice).toLocaleString()}`
+    }
+  } else {
+    if (customerOffer >= floorPrice * 0.95) {
+      return {
+        price: Math.round(floorPrice),
+        strategy: 'absolute_floor',
+        message: `Omo I am not making profit but just take am for ₦${Math.round(floorPrice).toLocaleString()}`
+      }
+    }
+    return {
+      price: null,
+      strategy: 'hard_reject',
+      message: `Capital never complete for that side boss. Best price is ₦${Math.round(floorPrice * 1.03).toLocaleString()}`
+    }
+  }
 }
 
 // ========================
-// TOOL EXECUTION LAYER
+// HARDENED TOOL EXECUTION
 // ========================
-async function executeTool(toolCall, businessId, phoneNumber, products = [], context = {}) {
+async function executeTool(toolCall, businessId, phoneNumber, products = [], convContext) {
   const { name, arguments: argsStr } = toolCall.function
   let args = {}
   try {
     args = JSON.parse(argsStr || '{}')
   } catch (e) {
-    console.error('[TOOL] Args parse error:', e.message)
+    console.error('[TOOL PARSE FAILURE]:', e.message)
   }
 
-  console.log(`[TOOL] 🔧 Executing ${name} with args:`, args)
+  console.log(`[EXECUTING SERVICE LAYER]: 🔧 ${name}`)
 
   switch (name) {
     case 'getProductList': {
-      if (!products || products.length === 0) return ERROR_MESSAGES.productNotFound
-
-      return (
-        'PRODUCT_LIST:\n' +
-        products
-          .map((p, index) => {
-            const name = (p.name || `Product ${index + 1}`).trim();
-            const price = p.price ? `₦${parseFloat(p.price).toLocaleString()}` : 'Price on request';
-            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : '';
-            return `${index + 1}. **${name}** - ${price}${negotiable}`;
-          })
-          .join('\n') +
-        '\n\nWhich one are you interested in?'
-      )
+      if (!products.length) return 'RESULT: No items cataloged.'
+      convContext.intent = 'browsing'
+      const list = products.map((p, i) => `${i + 1}. **${p.name}** - ₦${parseFloat(p.price).toLocaleString()}`).join('\n')
+      return `RESULT:STORE_LISTING\n${list}`
     }
 
     case 'getProductInfo': {
-      const product = findBestProductMatch(args.productName, products);
+      const item = findBestProductMatch(args.productName, products)
+      if (!item) return 'RESULT: Product profile out of stock.'
+      convContext.currentProduct = item.name
+      convContext.intent = 'interested'
+      return `RESULT:PRODUCT_META\nName: ${item.name}\nPrice: ₦${parseFloat(item.price).toLocaleString()}\nSpecs: ${item.description || 'Standard'}`
+    }
+
+    case 'makeCounterOffer': {
+      const item = findBestProductMatch(args.productName, products)
+      if (!item) return 'RESULT: Selected item matching profile is unavailable.'
+
+      const listPrice = parseFloat(item.price || 0)
+      const floorPrice = parseFloat(item.minPrice || item.floorPrice || (listPrice * 0.88))
       
-      if (product) {
-        const status = product.negotiationEnabled ? 'Negotiable' : 'Fixed price';
-        return `PRODUCT_INFO:${JSON.stringify({
-          name: product.name,
-          price: product.price,
-          description: product.description || 'No description provided.',
-          status
-        })}`
+      convContext.currentProduct = item.name
+      convContext.negotiationRound += 1
+      convContext.intent = 'negotiating'
+
+      const contract = calculateCounterOffer(args.customerOffer, listPrice, floorPrice, convContext.negotiationRound)
+      if (contract.strategy === 'accept') {
+        convContext.lastPrice = args.customerOffer
+      } else if (contract.price) {
+        convContext.lastPrice = contract.price
       }
-      return ERROR_MESSAGES.productNotFound
+
+      return `RESULT:NEGOTIATION_OUTCOME\n${JSON.stringify(contract)}`
     }
 
-    case 'createOrder': {
-      const orderId = `ORD-${Date.now()}-${phoneNumber.slice(-4)}`
-      try {
-        await db.collection('businesses').doc(businessId).collection('orders').doc(orderId).set({
-          orderId,
-          phoneNumber,
-          productName: args.productName,
-          quantity: args.quantity || 1,
-          agreedPrice: args.agreedPrice || null,
-          customerName: args.customerName || 'Pending',
-          status: 'draft',
-          createdAt: Date.now()
-        })
-        return `ORDER_CREATED:${orderId}: ${args.productName}`
-      } catch (e) {
-        console.error('[TOOL] Order creation failed:', e.message)
-        return ERROR_MESSAGES.orderCreation
-      }
-    }
-
-    case 'getPaymentDetails': {
+    case 'initiatePayment': {
       try {
         const reference = `REF-${Date.now()}-${phoneNumber.slice(-4)}`
-        const amountToCharge = parseFloat(args.agreedPrice) || 0
-        const targetProduct = args.productName || 'Order Transaction'
-        const customerName = args.customerName || 'WhatsApp Client'
+        const checkAmount = parseFloat(args.agreedPrice) || 0
+        const tag = args.productName || 'Inventory Order'
 
-        if (amountToCharge <= 0) {
-          return "We accept bank transfers via automated checkout. Could you confirm the item and price?"
-        }
+        if (checkAmount <= 0) return 'RESULT: Invalid pricing parameters.'
 
-        console.log(`[KORAPAY] Creating dynamic account for ${reference}, amount: ${amountToCharge}`)
+        convContext.intent = 'buying'
+        convContext.lastPrice = checkAmount
 
-        const koraResponse = await axios.post(`https://api.korapay.com/v1/charges/bank-transfer`, {
-          amount: amountToCharge,
-          reference: reference,
-          currency: 'NGN',
-          notification_url: 'https://aromsg.up.railway.app/korapay-webhook',
-          customer: {
-            name: customerName,
-            email: `${phoneNumber}@aromsg.app`
+        const koraResponse = await axios.post(
+          `https://api.korapay.com/v1/charges/bank-transfer`,
+          {
+            amount: checkAmount,
+            reference: reference,
+            currency: 'NGN',
+            notification_url: 'https://aromsg.up.railway.app/korapay-webhook',
+            customer: { name: 'WhatsApp Buyer', email: `${phoneNumber}@aromsg.app` },
+            merchant_bears_cost: false
           },
-          merchant_bears_cost: false
-        }, {
-          headers: { 
-            'Authorization': `Bearer ${KORA_SECRET_KEY}`,
-            'accept': 'application/json',
-            'content-type': 'application/json'
-          },
-          timeout: 15000
-        })
+          { headers: { 'Authorization': `Bearer ${KORA_SECRET_KEY}` }, timeout: 15000 }
+        )
 
-        const koraData = koraResponse.data
-
-        if (koraData && koraData.status === true && koraData.data?.bank_account_number) {
+        const payload = koraResponse.data
+        if (payload?.status === true && payload.data?.bank_account_number) {
+          const wire = payload.data
           await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
             reference,
-            phoneNumber,
-            amount: amountToCharge,
-            product: targetProduct,
-            customerName,
+            phoneNumber: phoneNumber.replace(/\D/g, ''),
+            amount: checkAmount,
+            product: tag,
             status: 'pending',
-            createdAt: Date.now(),
-            orderLinked: true,
-            koraRawResponse: koraData
+            createdAt: Date.now()
           })
 
-          return `RAW_KORAPAY_RESPONSE:${JSON.stringify({
-            success: koraData.status,
-            data: koraData.data,
-            reference: reference,
-            amount: amountToCharge,
-            product: targetProduct,
-            expiryMinutes: 20
-          })}`
+          return `RESULT:KORA_DYNAMIC_WIRE\nBank: ${wire.bank_name}\nAccountNumber: ${wire.bank_account_number}\nAccountName: ${wire.account_name}\nAmount: ₦${checkAmount.toLocaleString()}\nReference: ${reference}`
         }
-        
-        return `KORAPAY_FALLBACK_INFO: Ready to receive transfer for ${targetProduct} - Amount: ₦${amountToCharge} - Reference: ${reference}`
-
-      } catch (koraErr) {
-        console.error('[KORAPAY BACKEND ERROR]:', koraErr.response?.data || koraErr.message)
-        return "We're having a small issue generating your payment account. Please try again in a moment."
+        return 'RESULT: Dynamic channels unaligned. Try again.'
+      } catch (err) {
+        console.error('[KORAPAY CRITICAL]:', err.response?.data || err.message)
+        return 'RESULT: Payment interface unreachable.'
       }
     }
 
     case 'checkOrderStatus': {
       try {
-        const orderSnap = await db.collectionGroup('orders')
-          .where('reference', '==', args.orderId)
-          .limit(1)
-          .get()
-        
-        if (!orderSnap.empty) {
-          const order = orderSnap.docs[0].data()
-          return `ORDER_STATUS:${order.status || 'unknown'}|${order.product || 'N/A'}|${order.amount || 0}`
+        const snap = await db.collectionGroup('orders').where('reference', '==', args.orderId).limit(1).get()
+        if (!snap.empty) {
+          const match = snap.docs[0].data()
+          return `RESULT:INVOICE_STATUS\nStatus: ${match.status}\nItem: ${match.product}\nSum: ₦${match.amount?.toLocaleString()}`
         }
-        return `ORDER_STATUS:NOT_FOUND`
+        return 'RESULT: Invoice trace not found.'
       } catch (e) {
-        return `Let me check that order status for you.`
+        return 'RESULT: Query route error.'
       }
     }
-
-    default: {
-      return ERROR_MESSAGES.generic
-    }
+    default:
+      return 'RESULT: Action undefined.'
   }
 }
 
 // ========================
-// AI RESPONSE WITH TOOL SUPPORT
+// ENGINE PIPELINES
 // ========================
-async function getAIResponse(businessName, personality, productsContext, history, userMessage, userModel = null) {
-  const model = userModel || OPENROUTER_MODEL
-  
-  const systemPrompt = `You are an expert sales person representing ${businessName} on WhatsApp.
+async function getAIResponse(businessContext, historyPackage, userMessage, convContext) {
+  const { businessName, aiPersonality, productsContext } = businessContext
+  const { messages } = historyPackage
 
-${personality || 'You are friendly, smart, and business-focused.'}
+  const analyticalState = `
+[LIVE ENGINE STATE TRACKING]
+- FocusProduct: ${convContext.currentProduct || 'None'}
+- CustomRound: ${convContext.negotiationRound}
+- TargetLastPrice: ${convContext.lastPrice ? `₦${convContext.lastPrice}` : 'None'}
+- CurrentIntent: ${convContext.intent}
+`
 
-${productsContext || 'No inventory data verified.'}
-
-${CRITICAL_DIRECTIVES}`
+  const systemPrompt = `${MASTER_DIRECTIVES}
+BUSINESS NAME: ${businessName}
+PERSONALITY OVERLAY: ${aiPersonality || ''}
+${productsContext}
+${analyticalState}
+CRITICAL: Match actions meticulously. Keep lines down to casual 1-2 sentence frames.`
 
   try {
-    const formattedHistory = history.slice(-10).map((m) => ({
+    const structuredHistory = messages.slice(-12).map(m => ({
       role: m.role === 'user' ? 'user' : 'assistant',
-      content: m.text,
+      content: m.text
     }))
 
     const response = await axios.post(
       'https://openrouter.ai/api/v1/chat/completions',
       {
-        model: model,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          ...formattedHistory,
-          { role: 'user', content: userMessage },
-        ],
+        model: OPENROUTER_MODEL,
+        messages: [{ role: 'system', content: systemPrompt }, ...structuredHistory, { role: 'user', content: userMessage }],
         tools: AI_TOOLS,
         tool_choice: 'auto',
-        temperature: 0.55,
-        max_tokens: 850,
+        temperature: 0.5,
       },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          'HTTP-Referer': 'https://aromsg.up.railway.app',
-          'X-Title': 'AroMsg WhatsApp AI',
-        },
-        timeout: 25000,
-      }
+      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` }, timeout: 22000 }
     )
 
-    const message = response.data.choices[0]?.message
+    const choice = response.data.choices[0]?.message
+    if (choice.tool_calls?.length > 0) {
+      return { type: 'tool_call', tool: choice.tool_calls[0] }
+    }
+    return { type: 'text', content: choice.content?.trim() || 'I look you, give me one sec' }
+  } catch (err) {
+    console.error('[CORE REASONING LOOP ERROR]:', err.message)
+    return { type: 'text', content: 'Deji, let me confirm something sharp.' }
+  }
+}
 
-    if (message.tool_calls?.length > 0) {
-      console.log(`[AI] 🛠️ Tool called: ${message.tool_calls[0].function.name}`)
-      return {
-        type: 'tool_call',
-        tool: message.tool_calls[0],
-        content: message.content || '',
-      }
-    }
+async function synthesizeResponse(toolResult, businessName, userMessage, history) {
+  const customPrompt = `You are a native Nigerian individual running sales operations on WhatsApp for ${businessName}.
+Transform the raw data context block into an extremely clean, organic, human text response.
 
-    return {
-      type: 'text',
-      content: message.content?.trim() || ERROR_MESSAGES.generic,
-    }
-  } catch (error) {
-    console.error('[AI] Error:', error.response?.data || error.message)
-    return {
-      type: 'text',
-      content: ERROR_MESSAGES.generic,
-    }
+RULES:
+1. MAX 1-2 short casual conversational sentences.
+2. ABSOLUTELY NO BOLD MARKDOWN ASTERISKS (**). Keep things clean and flat.
+3. If the data details bank accounts (KORA_DYNAMIC_WIRE), write out the Bank Name, Account Number, and Account Name plainly on split clean clear lines so they can copy-paste easily.
+
+RAW SYSTEM DATA SUMMARY:
+${toolResult}
+
+CONVERSATION TIMELINE:
+${history.slice(-3).map(m => `${m.role}: ${m.text}`).join('\n')}`
+
+  try {
+    const res = await axios.post(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        model: OPENROUTER_MODEL,
+        messages: [{ role: 'system', content: customPrompt }, { role: 'user', content: userMessage }],
+        temperature: 0.4,
+      },
+      { headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` }, timeout: 15000 }
+    )
+    return res.data.choices[0]?.message?.content?.trim() || toolResult
+  } catch (e) {
+    return toolResult.replace(/RESULT:|[{}""[\]]/g, '').trim()
   }
 }
 
 // ========================
-// GET REFINEMENT DIRECTIVES
-// ========================
-const getRefinementDirectives = (businessName, currency) => `You are a real human merchant chatting on WhatsApp for ${businessName}.
-
-**CRITICAL STYLE RULES:**
-1. Keep the message short (1-2 sentences maximum). Be natural and direct.
-2. Absolutely DO NOT show code syntax, raw JSON characters, or backticks.
-3. NEVER use bold asterisks (**) in conversational text responses. Keep structural formatting for lists clean.
-4. If raw Korapay data is present, extract the Bank, Account Number, and Account Name cleanly in regular clear lines so they can copy-paste easily. Don't add extra fluff.`
-
-// ========================
-// SAVE MESSAGE + SEND REPLY
+// PERSISTENCE LAYERS
 // ========================
 async function saveMessage(businessId, phoneNumber, role, text, messageId) {
   try {
-    const timestamp = Date.now()
-    const normalizedPhone = phoneNumber.replace(/\D/g, '')
-
-    await db
-      .collection('businesses')
-      .doc(businessId)
-      .collection('whatsapp_messages')
-      .add({
-        contactJid: normalizedPhone,
-        from: role === 'user' ? normalizedPhone : businessId,
-        to: role === 'user' ? businessId : normalizedPhone,
-        text,
-        role,
-        platform: 'whatsapp',
-        messageId,
-        timestamp,
-        direction: role === 'user' ? 'incoming' : 'outgoing',
-      })
-
-    console.log(`[DB] ✅ Message saved: ${role} from ${phoneNumber}`)
+    const cleanNum = phoneNumber.replace(/\D/g, '')
+    await db.collection('businesses').doc(businessId).collection('whatsapp_messages').add({
+      contactJid: cleanNum,
+      from: role === 'user' ? cleanNum : businessId,
+      to: role === 'user' ? businessId : cleanNum,
+      text,
+      role,
+      messageId,
+      timestamp: Date.now()
+    })
     return true
-  } catch (err) {
-    console.error('[DB] Save error:', err.message)
-    return false
-  }
-}
-
-async function sendReplyViaGateway(userId, jid, replyText) {
-  try {
-    const normalizedJid = normalizeJid(jid)
-    await axios.post(
-      `${GATEWAY_URL}/send-message`,
-      {
-        userId,
-        to: normalizedJid,
-        text: replyText,
-      },
-      {
-        headers: { Authorization: `Bearer ${INTERNAL_API_KEY}` },
-        timeout: 12000,
-      }
-    )
-    console.log(`[GATEWAY] ✅ Sent to ${normalizedJid}`)
-    return true
-  } catch (err) {
-    console.error('[GATEWAY] Failed:', err.message)
-    return false
-  }
-}
-
-// ========================
-// POST-PAYMENT NOTIFICATION
-// ========================
-async function notifyPaymentSuccess(businessId, phoneNumber, orderData) {
-  try {
-    const message = `✅ *Payment received successfully!*\n\n` +
-                   `Product: ${orderData.product || 'Your Order'}\n` +
-                   `Amount: ₦${orderData.amount}\n` +
-                   `Reference: ${orderData.reference}\n\n` +
-                   `Thank you for your purchase! We'll process your order shortly.`
-
-    await sendReplyViaGateway(businessId, `${phoneNumber}@s.whatsapp.net`, message)
-    console.log(`[PAYMENT] ✅ Success notification sent to ${phoneNumber}`)
   } catch (e) {
-    console.error('[PAYMENT] Notification failed:', e.message)
+    return false
+  }
+}
+
+async function sendReplyViaGateway(userId, jid, text) {
+  try {
+    await axios.post(`${GATEWAY_URL}/send-message`, { userId, to: normalizeJid(jid), text }, {
+      headers: { Authorization: `Bearer ${INTERNAL_API_KEY}` }, timeout: 12000
+    })
+    return true
+  } catch (e) {
+    console.error('[GATEWAY FAILURE]:', e.message)
+    return false
   }
 }
 
 // ========================
-// MAIN WEBHOOK
+// WEBHOOK ROUTERS
 // ========================
 app.post('/webhook', async (req, res) => {
   try {
-    const authHeader = req.headers.authorization
-    if (!authHeader || authHeader !== `Bearer ${INTERNAL_API_KEY}`) {
-      return res.status(401).json({ success: false, error: 'Unauthorized' })
+    if (req.headers.authorization !== `Bearer ${INTERNAL_API_KEY}`) {
+      return res.status(401).json({ success: false })
     }
 
     const { userId, from, text, messageId } = req.body
-    if (!userId || !from || !text) {
-      return res.status(400).json({ success: false, error: 'Missing fields' })
-    }
+    if (!userId || !from || !text) return res.status(400).json({ error: 'Payload empty' })
 
     const normalizedFrom = normalizeJid(from)
     const phoneNumber = normalizedFrom.replace('@s.whatsapp.net', '')
 
-    console.log(`[WEBHOOK] 📨 Message from ${phoneNumber}: ${text.substring(0, 70)}...`)
+    const storeContext = await getBusinessContext(userId)
+    if (!storeContext) return res.status(404).json({ error: 'Store missed' })
 
-    const context = await getBusinessContext(userId)
-    if (!context) {
-      return res.status(404).json({ success: false, error: 'Business not found' })
-    }
+    // Load persistent state context directly from FireStore
+    const convContext = await getOrCreateConversationContext(userId, phoneNumber)
+    const structuralHistory = await getConversationHistory(userId, phoneNumber)
 
-    const businessDoc = await db.collection('businesses').doc(userId).get()
-    const businessData = businessDoc.data() || {}
-    const userModel = businessData.openrouterModel || OPENROUTER_MODEL
-    const userCurrency = businessData.currency || 'NGN'
+    const routingDecision = await getAIResponse(storeContext, structuralHistory, text, convContext)
 
-    const history = await getConversationHistory(userId, phoneNumber)
+    let definitiveReply
 
-    console.log('[WEBHOOK] 🤖 Generating AI response with model:', userModel)
-    const aiResult = await getAIResponse(
-      context.businessName,
-      context.aiPersonality,
-      context.productsContext,
-      history,
-      text,
-      userModel
-    )
-
-    let replyText
-
-    if (aiResult.type === 'tool_call') {
-      console.log('[WEBHOOK] 🔧 AI called tool:', aiResult.tool.function.name)
-      const toolResult = await executeTool(aiResult.tool, userId, phoneNumber, context.products || [], context)
-
-      console.log('[WEBHOOK] 🔄 Re-routing tool data to AI for natural language synthesis...')
-
-      try {
-        const refinementPrompt =
-          getRefinementDirectives(context.businessName, userCurrency) +
-          '\n\nDatabase Response:\n"""' +
-          toolResult +
-          '"""'
-
-        const refinedResponse = await axios.post(
-          'https://openrouter.ai/api/v1/chat/completions',
-          {
-            model: userModel,
-            messages: [
-              { role: 'system', content: refinementPrompt },
-              ...history.slice(-8).map((m) => ({
-                role: m.role === 'user' ? 'user' : 'assistant',
-                content: m.text,
-              })),
-              { role: 'user', content: text },
-            ],
-            temperature: 0.45,
-            max_tokens: 500,
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-              'HTTP-Referer': 'https://aromsg.up.railway.app',
-              'X-Title': 'AroMsg WhatsApp AI',
-            },
-            timeout: 20000,
-          }
-        )
-
-        replyText = refinedResponse.data.choices[0]?.message?.content?.trim() || ERROR_MESSAGES.toolExecution
-      } catch (refineErr) {
-        console.error('[WEBHOOK] ⚠️ Refinement error:', refineErr.message)
-        replyText = toolResult.replace(/RAW_KORAPAY_RESPONSE:|PRODUCT_LIST:|PRODUCT_INFO:|ORDER_/g, '').trim()
-      }
+    if (routingDecision.type === 'tool_call') {
+      const internalExecution = await executeTool(routingDecision.tool, userId, phoneNumber, storeContext.products, convContext)
+      definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
     } else {
-      replyText = aiResult.content
+      definitiveReply = routingDecision.content
     }
+
+    // Sanitize technical leak strings
+    definitiveReply = definitiveReply
+      .replace(/```json|```/gi, '')
+      .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|KORA_DYNAMIC_WIRE/gi, '')
+      .trim()
 
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
-    await saveMessage(userId, phoneNumber, 'assistant', replyText, `ai_${Date.now()}`)
-    await sendReplyViaGateway(userId, normalizedFrom, replyText)
+    await saveMessage(userId, phoneNumber, 'assistant', definitiveReply, `ai_${Date.now()}`)
+    
+    // Core state save back to FireStore database
+    await saveConversationContext(userId, phoneNumber, convContext)
+    await sendReplyViaGateway(userId, normalizedFrom, definitiveReply)
 
-    console.log('[WEBHOOK] ✅ Complete\n' + '='.repeat(60))
-
-    res.json({
-      success: true,
-      reply: replyText,
-      mode: aiResult.type,
-      tool: aiResult.type === 'tool_call' ? aiResult.tool.function.name : null,
-      messagesSaved: true,
-      gatewaySent: true,
-    })
+    res.json({ success: true, intent: convContext.intent })
   } catch (err) {
-    console.error('[WEBHOOK] Error:', err.message)
-    res.status(500).json({ success: false, error: 'Internal server error' })
+    console.error('[ROUTING EXCEPTION]:', err.message)
+    res.status(500).json({ success: false })
   }
 })
 
 // ========================
-// KORAPAY WEBHOOK
+// KORAPAY WEBHOOK VERIFICATION
 // ========================
 function verifyKoraSignature(body, signature) {
   if (!signature || !KORA_SECRET_KEY) return false
-
   try {
-    const hash = crypto
-      .createHmac('sha256', KORA_SECRET_KEY)
-      .update(JSON.stringify(body.data))
-      .digest('hex')
-
+    const payloadString = JSON.stringify(body.data)
+    const hash = crypto.createHmac('sha256', KORA_SECRET_KEY).update(payloadString).digest('hex')
     return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature))
-  } catch (error) {
-    console.error('Signature verification error:', error)
+  } catch {
     return false
-  }
-}
-
-async function forwardToProduct(productUrl, payload) {
-  try {
-    if (!productUrl) return
-    await axios.post(productUrl, payload, {
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 8000,
-    })
-  } catch (error) {
-    console.error(`Failed to forward to ${productUrl}:`, error.message)
   }
 }
 
@@ -716,62 +622,32 @@ app.post('/korapay-webhook', async (req, res) => {
   const signature = req.headers['x-korapay-signature']
   const body = req.body
 
-  if (!verifyKoraSignature(body, signature)) {
-    console.warn('Invalid Kora webhook signature received.')
-    return res.status(200).json({ received: true })
-  }
-
+  if (!verifyKoraSignature(body, signature)) return res.status(200).json({ received: true })
   res.status(200).json({ received: true })
 
   setImmediate(async () => {
     const data = body.data || {}
-    const reference = data.reference || data.payment_reference || data.unique_reference || ''
-    const event = body.event || ''
-
-    console.log(`[KORA-WEBHOOK] 📨 Event: ${event}, Reference: ${reference}`)
-
-    if (reference.startsWith('REF-') && event === 'charge.success') {
-      console.log(`[KORA-WEBHOOK] ✅ Successful payment for WhatsApp order: ${reference}`)
-      
+    const reference = data.reference || data.payment_reference || ''
+    if (reference.startsWith('REF-') && body.event === 'charge.success') {
       try {
-        const ordersRef = db.collectionGroup('orders').where('reference', '==', reference)
-        const snapshot = await ordersRef.get()
-
+        const snapshot = await db.collectionGroup('orders').where('reference', '==', reference).limit(1).get()
         if (!snapshot.empty) {
-          for (const doc of snapshot.docs) {
-            const orderData = doc.data()
-            await doc.ref.update({
-              status: 'success',
-              updatedAt: Date.now(),
-              rawWebhookPayload: body,
-              paidAt: Date.now()
-            })
+          const docTarget = snapshot.docs[0]
+          const orderData = docTarget.data()
+          await docTarget.ref.update({ status: 'success', paidAt: Date.now() })
 
-            await notifyPaymentSuccess(doc.ref.parent.parent.id, orderData.phoneNumber, orderData)
-          }
+          const summaryAlert = `✅ *Payment Confirmed!* \n\nReceived payment for: ${orderData.product}\nValue: ₦${orderData.amount.toLocaleString()}\n\nProcessing order details immediately! 🚀`
+          await sendReplyViaGateway(docTarget.ref.parent.parent.id, `${orderData.phoneNumber}@s.whatsapp.net`, summaryAlert)
         }
-      } catch (dbErr) {
-        console.error('[KORA-WEBHOOK] Firestore update failure:', dbErr.message)
+      } catch (e) {
+        console.error('[KORA MATCH FAIL]:', e.message)
       }
-    } 
-    else if (reference.startsWith('PRODA-') || reference.includes('producta')) {
-      await forwardToProduct(PRODUCT_A_WEBHOOK, body)
-    } 
-    else if (reference.startsWith('PRODB-') || reference.includes('productb')) {
-      await forwardToProduct(PRODUCT_B_WEBHOOK, body)
     }
   })
 })
 
-// ========================
-// HEALTH & INITIALIZATION
-// ========================
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'AroMsg AI Decision Brain' })
-})
+app.get('/health', (req, res) => res.json({ status: 'online', memory: process.memoryUsage().heapUsed / 1024 / 1024 }))
 
-app.listen(PORT, () => {
-  console.log(`🚀 AroMsg AI Decision Brain running on port ${PORT}`)
-})
+app.listen(PORT, () => console.log(`🚀 Production Architecture Scaled On Port ${PORT}`))
 
 module.exports = app
