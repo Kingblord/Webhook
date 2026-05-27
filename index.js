@@ -100,14 +100,15 @@ async function getBusinessContext(businessId) {
     let productsContext = ''
     if (products.length > 0) {
       productsContext =
-        '\nAvailable Products, Base Display Prices, and Floor Limits:\n' +
+        '\nINVENTORY DATA:\n' +
         products
           .map((p) => {
-            const negotiable = p.negotiationEnabled ? ' [Negotiable]' : ' [Fixed Price Only]'
-            const minPrice = p.minPrice || p.floorPrice || (p.price * 0.85)
-            return `- Name: ${p.name} | Display Price: ₦${p.price}${negotiable} | Absolute Minimum Internal Floor Price Allowed: ₦${minPrice} | Description: ${p.description || 'None'}`
+            const negotiable = p.negotiationEnabled ? 'Yes' : 'No'
+            const basePrice = parseFloat(p.price || 0)
+            const floorPrice = parseFloat(p.minPrice || p.floorPrice || (basePrice * 0.88))
+            return `- Item: ${p.name}\n  Listed Price: ₦${basePrice.toLocaleString()}\n  Is Negotiable: ${negotiable}\n  CONFIDENTIAL MERCHANDISE FLOOR: ₦${floorPrice.toLocaleString()}\n  Description: ${p.description || 'No custom description available'}`
           })
-          .join('\n')
+          .join('\n\n')
     }
 
     return {
@@ -169,7 +170,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'getPaymentDetails',
-      description: 'Get payment methods and instructions or request direct Korapay virtual account to pay immediately',
+      description: 'Generate dynamic payment credentials using the Korapay bank transfer framework. Run this immediately when the customer accepts an agreed price, asks how to pay, or is ready to check out.',
       parameters: {
         type: 'object',
         properties: {
@@ -200,11 +201,13 @@ const AI_TOOLS = [
 // ========================
 const CRITICAL_DIRECTIVES = `
 **CRITICAL OPERATIONAL & WHATSAPP CHAT DIRECTIVES:**
-1. Keep replies extremely short, human, and conversational. Speak like a real person handling chats on WhatsApp, not an AI engine. Maximum 1-2 concise sentences per response unless outputting a product catalog.
-2. NEVVER use raw code syntax or brackets.
-3. NEVER use bold asterisks (**) everywhere. ONLY use bold formatting sparingly around product names when delivering an itemized list. Never use it in normal chat conversation text.
-4. NEGOTIATION POLICY: You have access to the absolute minimum floor prices in the inventory data below. If a user offers below the Display Price but above or equal to the Internal Floor Price, you can accept their offer directly and push for the checkout! If they offer below the absolute minimum floor price, politely reject the price, explain that it's too low, and offer a counter-price right around your floor limit to secure the deal. Do not say you need to check or reach out to anyone—you are empowered to make the deal right now.
-5. If the user accepts a price or is ready to purchase, call createOrder or getPaymentDetails tool immediately to generate their checkout account details.
+1. CHAT STYLE: Speak exactly like a local, professional, real human merchant on WhatsApp. Keep messages ultra-short and precise (1-2 sentences max). 
+2. NO MARKDOWN ABUSE: Never put bold asterisks (**) on regular text phrases or sentences. Only use bold formatting inside structural catalogs or list outputs.
+3. REALISTIC NEGOTIATION RULES: 
+   - Never reveal or blurt out the 'CONFIDENTIAL MERCHANDISE FLOOR'.
+   - If the customer counters with a very low price (e.g., offering 600k for a 1.3M item), do NOT drop immediately to your minimum floor price. Instead, negotiate like a real person trying to keep margins high! Drop the price slightly (e.g., try 1.15M or 1.1M first). Counter-offer step by step. Only use the floor price as your absolute final shield line if they push hard.
+   - If a customer makes an offer that is strictly equal to or above the 'CONFIDENTIAL MERCHANDISE FLOOR', you can choose to accept it gracefully to close the deal fast.
+4. MANDATORY PAYMENT TOOL TRIGGER: When a customer says "how can I pay", accepts a counter-price, or says an offer is cool, you MUST immediately call the 'getPaymentDetails' tool. Never write fake account details, fake bank names, or placeholders. You do not have manual bank accounts; you depend completely on the tool execution layer to give you real data.
 `
 
 // ========================
@@ -421,14 +424,11 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 async function getAIResponse(businessName, personality, productsContext, history, userMessage, userModel = null) {
   const model = userModel || OPENROUTER_MODEL
   
-  const systemPrompt = `You are a smooth, humanized AI Sales Representative for ${businessName}.
+  const systemPrompt = `You are an expert sales person representing ${businessName} on WhatsApp.
 
-${personality || 'You are friendly, local, witty, and focused on helping closing sales on WhatsApp.'}
+${personality || 'You are friendly, smart, and business-focused.'}
 
-Current Business Inventory & Context:
-"""
-${productsContext || 'No product data available.'}
-"""
+${productsContext || 'No inventory data verified.'}
 
 ${CRITICAL_DIRECTIVES}`
 
@@ -449,7 +449,7 @@ ${CRITICAL_DIRECTIVES}`
         ],
         tools: AI_TOOLS,
         tool_choice: 'auto',
-        temperature: 0.65,
+        temperature: 0.55,
         max_tokens: 850,
       },
       {
@@ -489,13 +489,13 @@ ${CRITICAL_DIRECTIVES}`
 // ========================
 // GET REFINEMENT DIRECTIVES
 // ========================
-const getRefinementDirectives = (businessName, currency) => `You are an incredibly smooth, concise WhatsApp vendor for ${businessName}.
+const getRefinementDirectives = (businessName, currency) => `You are a real human merchant chatting on WhatsApp for ${businessName}.
 
 **CRITICAL STYLE RULES:**
-1. Keep the message to exactly 1 or 2 conversational lines.
-2. Absolutely DO NOT include code syntax, brackets, JSON text, or tags.
-3. NEVER use bold markdown tag structures (**) unless you are presenting a clean product itemization list. Keep sentences clean and plain text.
-4. Process data context explicitly from the Database Response block.`
+1. Keep the message short (1-2 sentences maximum). Be natural and direct.
+2. Absolutely DO NOT show code syntax, raw JSON characters, or backticks.
+3. NEVER use bold asterisks (**) in conversational text responses. Keep structural formatting for lists clean.
+4. If raw Korapay data is present, extract the Bank, Account Number, and Account Name cleanly in regular clear lines so they can copy-paste easily. Don't add extra fluff.`
 
 // ========================
 // SAVE MESSAGE + SEND REPLY
@@ -639,7 +639,7 @@ app.post('/webhook', async (req, res) => {
               })),
               { role: 'user', content: text },
             ],
-            temperature: 0.5,
+            temperature: 0.45,
             max_tokens: 500,
           },
           {
