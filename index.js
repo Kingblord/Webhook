@@ -1,4 +1,3 @@
-
 const express = require('express')
 const dotenv = require('dotenv')
 const axios = require('axios')
@@ -67,7 +66,8 @@ async function getOrCreateConversationContext(businessId, phoneNumber) {
           currentProduct: null,
           lastPrice: null,
           negotiationRound: 0,
-          intent: 'browsing'
+          intent: 'browsing',
+          lastReference: null
         }
       }
       return data
@@ -80,7 +80,8 @@ async function getOrCreateConversationContext(businessId, phoneNumber) {
     currentProduct: null,
     lastPrice: null,
     negotiationRound: 0,
-    intent: 'browsing'
+    intent: 'browsing',
+    lastReference: null
   }
 }
 
@@ -227,10 +228,15 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'checkOrderStatus',
-      description: 'Verify payment or tracking records using the tracking reference ID.',
+      description: 'Verify payment or tracking records using the tracking reference ID. Call this when the user says they are done, have sent proof, or uploaded a receipt.',
       parameters: {
         type: 'object',
-        properties: { orderId: { type: 'string' } },
+        properties: { 
+          orderId: { 
+            type: 'string',
+            description: 'The transaction reference ID (e.g. KPY-PAY-...). Find this in LastReference.'
+          } 
+        },
         required: ['orderId'],
       },
     },
@@ -250,9 +256,11 @@ const MASTER_DIRECTIVES = `
 - Never say "Internal protected floor" or reveal bottom metrics.
 - If a client bids drastically low, do NOT break or dump down to your lowest floor limits instantly. Step down gradually: Drop roughly 8% in Round 1, 12% in Round 2, and approach floor metrics only during desperate Round 3 push efforts.
 - If their offer cleanly hits or matches above your internal protected metrics floor, lock the deal immediately and move directly to checking out.
+- ABSOLUTELY FORBIDDEN: Never generate, make up, or display ANY bank name, account number, or payment details in your conversational text. All payment details must come EXCLUSIVELY from executing the 'initiatePayment' tool. If you have not called that tool, do not mention any bank accounts.
 
-⚡ INSTANT PAYMENT PROTOCOL:
-- When the deal lands or the user gives explicit greenlights ("send account", "how can I pay", "cool", "I will pay", "send gimme na"), you MUST call 'initiatePayment' tool instantly. Never fabricate fake banks, transfer tables, or placeholder digits. Show them the calculated bank credentials directly.
+⚠️ VERIFICATION AND IMAGE HANDLING PROTOCOL:
+- You cannot see or read images or receipt screenshots. If the user sends an image/receipt or says "Done", "I have paid", "sent", do NOT say "Payment received" or "Your order is confirmed" right away!
+- Instead, you MUST call the 'checkOrderStatus' tool to query the bank network status using the LastReference, or politely explain to the customer that the payment is automatically tracked and you are waiting for the bank network clearance alert.
 `
 
 function findBestProductMatch(query, products) {
@@ -338,7 +346,6 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     'sec-fetch-site': 'same-origin'
   }
 
-  // Sanitize phone number safely to avoid any double @ symbols in the email!
   const cleanPhone = phoneNumber.replace(/\D/g, '')
   const sanitizedEmail = `${cleanPhone}@cloutivaapp.shop`
 
@@ -415,7 +422,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           data: {
             customer: {
               name: "WhatsApp Client",
-              email: sanitizedEmail // Perfect sanitized format!
+              email: sanitizedEmail
             },
             amount: String(checkAmount),
             currency: "NGN",
@@ -442,6 +449,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         }
 
         console.log(`✅ [STEP 2 SUCCESS] Payment Reference Obtained: ${solvedPaymentReference}`);
+        convContext.lastReference = solvedPaymentReference // Save the transaction ID in conversation state!
 
         // --------------------------------------------------------------------
         // 📡 STEP 3: BANK CHARGE (Resolves direct Sterling Bank transfers details)
@@ -466,6 +474,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         
         const dynamicAccountNumber = bankDetails.account_number
         const dynamicBankName = bankDetails.bank_name
+        const dynamicAccountName = bankDetails.account_name || "Korapay-LIT-CHKOUT"
         const finalExpectedAmount = parseFloat(chargePayload.amount_expected || chargePayload.amount || checkAmount)
 
         if (!dynamicAccountNumber || dynamicAccountNumber === '0000000000') {
@@ -473,7 +482,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           return `RESULT:KORA_API_FETCH_FAILED`
         }
 
-        console.log(`✅ [STEP 3 SUCCESS] Account: ${dynamicAccountNumber} | Bank: ${dynamicBankName} | Expecting: ₦${finalExpectedAmount}`);
+        console.log(`✅ [STEP 3 SUCCESS] Account: ${dynamicAccountNumber} | Bank: ${dynamicBankName} | Name: ${dynamicAccountName} | Expecting: ₦${finalExpectedAmount}`);
 
         // Save order configuration details to database collections
         await db.collection('businesses').doc(businessId).collection('orders').doc(solvedPaymentReference).set({
@@ -484,10 +493,12 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           status: 'pending',
           createdAt: Date.now(),
           generatedAccount: dynamicAccountNumber,
-          generatedBank: dynamicBankName
+          generatedBank: dynamicBankName,
+          generatedAccountName: dynamicAccountName,
+          expiryPeriod: "60 minutes"
         })
 
-        return `RESULT:BANK_TRANSFER_PAYLOAD_GENERATION\nAmount: ₦${finalExpectedAmount.toLocaleString()}\nReference: ${solvedPaymentReference}\nBankAccountNumber: ${dynamicAccountNumber}\nBankName: ${dynamicBankName}`
+        return `RESULT:BANK_TRANSFER_PAYLOAD_GENERATION\nAmount: ₦${finalExpectedAmount.toLocaleString()}\nReference: ${solvedPaymentReference}\nBankAccountNumber: ${dynamicAccountNumber}\nBankName: ${dynamicBankName}\nBankAccountName: ${dynamicAccountName}\nExpiryTime: This account expires in 60 minutes`
         
       } catch (err) {
         console.error('❌ [INTERNAL PIPELINE EXECUTOR FAILURE]:', err.response?.data || err.message)
@@ -537,6 +548,7 @@ async function getAIResponse(businessContext, historyPackage, userMessage, convC
 - CustomRound: ${convContext.negotiationRound}
 - TargetLastPrice: ${convContext.lastPrice ? `₦${convContext.lastPrice}` : 'None'}
 - CurrentIntent: ${convContext.intent}
+- LastReference: ${convContext.lastReference || 'None'}
 `
 
   const systemPrompt = `${MASTER_DIRECTIVES}
@@ -586,7 +598,14 @@ Transform the raw data payload directly into a short, natural, conversational hu
 RULES:
 1. MAX 1-2 short casual sentences. Do not spam words.
 2. ABSOLUTELY NO BOLD MARKDOWN ASTERISKS (**). Keep text flat and clear.
-3. Inform them directly of the account number and bank name generated from the system data summary so they can perform the transfer instantly.
+3. If the data summary is BANK_TRANSFER_PAYLOAD_GENERATION, inform them of:
+   - Account Number
+   - Bank Name
+   - Account Name (MUST include this!)
+   - Expiration warning (expires in 60 minutes)
+4. If the data is INVOICE_STATUS:
+   - If Status is 'confirmed': Congratulate them and let them know the payment is confirmed, order is locked, and processing sharp sharp.
+   - If Status is 'pending_confirmation': Politely explain that the transfer hasn't cleared on the bank network yet, but the system is monitoring it and will drop the receipt the second it hits. No need for them to send proof since it's auto-tracked!
 
 RAW SYSTEM DATA SUMMARY:
 ${toolResult}
@@ -669,12 +688,10 @@ app.post('/webhook', async (req, res) => {
     let definitiveReply
 
     if (routingDecision.type === 'tool_call' && routingDecision.tool.function.name === 'initiatePayment') {
-      // Step 1: Send immediate load acknowledgement to avoid WhatsApp gateways timing out while API waits
       const loadingPhrase = "Hold on na, make I get your account transfer details sharp sharp..."
       await sendReplyViaGateway(userId, normalizedFrom, loadingPhrase)
       await saveMessage(userId, phoneNumber, 'assistant', loadingPhrase, `ai_load_${Date.now()}`)
 
-      // Step 2: Now synchronously execute the 3-step checkout generation
       const internalExecution = await executeTool(routingDecision.tool, userId, phoneNumber, storeContext.products, convContext)
       definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
     } else if (routingDecision.type === 'tool_call') {
@@ -762,7 +779,8 @@ app.post('/korapay-webhook', async (req, res) => {
             currentProduct: null,
             lastPrice: null,
             negotiationRound: 0,
-            intent: 'browsing'
+            intent: 'browsing',
+            lastReference: null
           })
 
           const receiptAlert = `🧾 *TRANSACTION RECEIPT*
@@ -790,5 +808,3 @@ app.get('/health', (req, res) => res.json({ status: 'online', memory: process.me
 app.listen(PORT, () => console.log(`🚀 Dedicated Production Engine Running Inline 4-Step Hook Arrays On Port ${PORT}`))
 
 module.exports = app
-
-
