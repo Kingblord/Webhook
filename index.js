@@ -87,10 +87,12 @@ async function saveConversationContext(businessId, phoneNumber, contextData) {
   const cleanPhone = phoneNumber.replace(/\D/g, '')
   const docRef = db.collection('businesses').doc(businessId).collection('contexts').doc(cleanPhone)
   try {
-    await docRef.set({
-      ...contextData,
-      lastInteraction: Date.now()
-    }, { merge: true })
+    await db.runTransaction(async (transaction) => {
+      transaction.set(docRef, {
+        ...contextData,
+        lastInteraction: Date.now()
+      }, { merge: true })
+    })
   } catch (e) {
     console.error('[CONTEXT DB SAVE ERROR]:', e.message)
   }
@@ -194,7 +196,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'makeCounterOffer',
-      description: 'Call this ONLY when a customer requests a cheaper price or presents a lower counter offer.',
+      description: 'Call this ONLY when a customer requests a cheaper price or presents a lower counter offer counter budget.',
       parameters: {
         type: 'object',
         properties: {
@@ -209,7 +211,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'initiatePayment',
-      description: 'CRITICAL: Run this instantly when the customer accepts an agreed price, says ok/cool/send account, or is ready to make a transfer.',
+      description: 'CRITICAL: Run this instantly when the customer accepts an agreed price, says ok/cool/send account, or is ready to make transaction transfers.',
       parameters: {
         type: 'object',
         properties: {
@@ -249,8 +251,7 @@ const MASTER_DIRECTIVES = `
 - If their offer cleanly hits or matches above your internal protected metrics floor, lock the deal immediately and move directly to checking out.
 
 ⚡ INSTANT PAYMENT PROTOCOL:
-- When the deal lands or the user gives explicit greenlights ("send account", "how can I pay", "cool", "send gimme na"), you MUST call 'initiatePayment' tool instantly. Never fabricate fake banks, transfer tables, or placeholder digits.
-- CRITICAL: You must wait for the actual real bank credentials from the API. Never make up or fake an account number or bank name if the data is not fully fetched.
+- When the deal lands or the user gives explicit greenlights ("send account", "how can I pay", "cool", "I will pay", "send gimme na"), you MUST call 'initiatePayment' tool instantly. Never fabricate fake banks, transfer tables, or placeholder digits. Show them the calculated bank credentials directly.
 `
 
 function findBestProductMatch(query, products) {
@@ -312,7 +313,7 @@ function calculateCounterOffer(customerOffer, listPrice, floorPrice, round) {
 }
 
 // ============================================================================
-// 🏦 INLINE 4-STEP RECURSIVE BANK TRANSFERS WITH END-TO-END TELEMETRY LOGGING
+// 🏦 EXACT NEXT.JS MATCHING PROXY 4-STEP EXECUTOR WITH FULL VERBOSE TELEMETRY
 // ============================================================================
 async function executeTool(toolCall, businessId, phoneNumber, products = [], convContext) {
   const { name, arguments: argsStr } = toolCall.function
@@ -323,13 +324,13 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     console.error('[TOOL PARSE FAILURE]:', e.message)
   }
 
-  // Injecting explicit Authorization header blocks to prevent placeholder fallbacks
-  const authenticatedHeaders = {
+  // Exact configuration matching your Next.js native checkout headers profile
+  const nativeCheckoutHeaders = {
     'accept': 'application/json',
+    'accept-language': 'en-US,en;q=0.9',
     'content-type': 'application/json',
-    'Authorization': `Bearer ${KORAPAY_SECRET_KEY}`,
     'priority': 'u=1, i',
-    'sec-ch-ua': '"Microsoft Edge";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    'sec-ch-ua': '"Microsoft Edge";v=147", "Not.A/Brand";v="8", "Chromium";v="147"',
     'sec-ch-ua-mobile': '?0',
     'sec-ch-ua-platform': '"Windows"',
     'sec-fetch-dest': 'empty',
@@ -386,7 +387,7 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         convContext.lastPrice = checkAmount
 
         // --------------------------------------------------------------------
-        // LOG STEP 1: CREATE PAYMENT LINK REQUEST/RESPONSE
+        // 📡 STEP 1: CREATE PAYMENT LINK (Uses Public Key inside JSON payload body)
         // --------------------------------------------------------------------
         const step1Payload = {
           key: KORAPAY_PUBLIC_KEY, 
@@ -399,59 +400,59 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           },
           notification_url: "https://lit-proxy.vercel.app/api/proxy?provider=kora"
         }
-        console.log(`📡 [LOG STEP 1 REQUEST] Outbound URL: https://checkout.korapay.com/?type=payment-link`, JSON.stringify(step1Payload, null, 2));
+        console.log(`📡 [CREATE-PAYMENT REQUEST] URL: https://checkout.korapay.com/?type=payment-link`, JSON.stringify(step1Payload, null, 2));
         
         const createRes = await axios.post(
           'https://checkout.korapay.com/?type=payment-link',
           step1Payload,
-          { headers: authenticatedHeaders, timeout: 15000 }
+          { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
-        console.log(`📨 [LOG STEP 1 RESPONSE] Raw Inbound:`, JSON.stringify(createRes.data, null, 2));
+        console.log(`Inbound Status (${createRes.status}) - Response Data:`, JSON.stringify(createRes.data, null, 2));
 
         // --------------------------------------------------------------------
-        // LOG STEP 2: VALIDATE LINK LOOKUP REQUEST/RESPONSE
+        // 📡 STEP 2: VALIDATE LINK (Resolves internal txn_id)
         // --------------------------------------------------------------------
         const step2Payload = { slug: reference, env: 'live' }
-        console.log(`📡 [LOG STEP 2 REQUEST] Outbound URL: https://checkout.korapay.com/validate-link`, JSON.stringify(step2Payload, null, 2));
+        console.log(`📡 [VALIDATE-LINK REQUEST] URL: https://checkout.korapay.com/validate-link`, JSON.stringify(step2Payload, null, 2));
         
         const validateRes = await axios.post(
           'https://checkout.korapay.com/validate-link',
           step2Payload,
-          { headers: authenticatedHeaders, timeout: 15000 }
+          { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
-        console.log(`📨 [LOG STEP 2 RESPONSE] Raw Inbound:`, JSON.stringify(validateRes.data, null, 2));
+        console.log(`Inbound Status (${validateRes.status}) - Response Data:`, JSON.stringify(validateRes.data, null, 2));
 
-        const lookupDetails = validateRes.data?.data
+        const lookupDetails = validateRes.data?.data?.data || validateRes.data?.data
         const sessionTransactionId = lookupDetails?.txn_id || lookupDetails?.id || reference
 
         // --------------------------------------------------------------------
-        // LOG STEP 3: BANK CHARGE REQUEST/RESPONSE
+        // 📡 STEP 3: BANK CHARGE (Acquires dedicated account details natively)
         // --------------------------------------------------------------------
         const step3Payload = {
           transaction_id: sessionTransactionId,
           bank_code: "090270", 
           env: 'live'
         }
-        console.log(`📡 [LOG STEP 3 REQUEST] Outbound URL: https://checkout.korapay.com/bank/charge`, JSON.stringify(step3Payload, null, 2));
+        console.log(`📡 [BANK-CHARGE REQUEST] URL: https://checkout.korapay.com/bank/charge`, JSON.stringify(step3Payload, null, 2));
         
         const bankChargeRes = await axios.post(
           'https://checkout.korapay.com/bank/charge',
           step3Payload,
-          { headers: authenticatedHeaders, timeout: 15000 }
+          { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
-        console.log(`📨 [LOG STEP 3 RESPONSE] Raw Inbound:`, JSON.stringify(bankChargeRes.data, null, 2));
+        console.log(`Inbound Status (${bankChargeRes.status}) - Response Data:`, JSON.stringify(bankChargeRes.data, null, 2));
 
         const bankData = bankChargeRes.data?.data || {}
         const dynamicAccountNumber = bankData.account_number || bankData.payment_details?.account_number
         const dynamicBankName = bankData.bank_name || bankData.payment_details?.bank_name
 
-        // Intercept placeholder objects. Force a strict retry loop state if details are missing.
+        // Intercept mock fallbacks or empty responses securely
         if (!dynamicAccountNumber || dynamicAccountNumber === '0000000000') {
-          console.warn(`⚠️ [AUTHENTICATION WARN] Server received empty or mock fallback account parameters. Intercepting response parsing layer.`);
-          return `RESULT:SYSTEM_BUSY_RETRY\nMessage: System is updating bank configuration records. Please hold on for a minute.`
+          console.warn(`⚠️ [MOCK DETECTED] Missing dynamic account details. Returning error token to intercept response synthesizing.`);
+          return `RESULT:KORA_API_FETCH_FAILED`
         }
 
-        // Save valid transaction safely inside Firestore database
+        // Save order structure inside database references
         await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
           reference,
           phoneNumber: phoneNumber.replace(/\D/g, ''),
@@ -466,19 +467,19 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         return `RESULT:BANK_TRANSFER_PAYLOAD_GENERATION\nAmount: ₦${checkAmount.toLocaleString()}\nReference: ${reference}\nBankAccountNumber: ${dynamicAccountNumber}\nBankName: ${dynamicBankName}`
         
       } catch (err) {
-        console.error('❌ [4-STEP TELEMETRY PIPELINE RUNTIME ERROR]:', err.response?.data || err.message)
-        return `RESULT:SYSTEM_BUSY_RETRY\nMessage: Network interface timed out while creating account. Please try again.`
+        console.error('❌ [PIPELINE RUNTIME FAULT]:', err.response?.data || err.message)
+        return `RESULT:KORA_API_FETCH_FAILED`
       }
     }
 
     case 'checkOrderStatus': {
       try {
-        console.log(`🔍 [VERIFY ENGINE ACTIVE]: Checking validation status for reference ID: ${args.orderId}`);
+        console.log(`🔍 [VERIFY ENGINE ACTIVE]: Checking validation state status for reference ID: ${args.orderId}`);
         
         const verifyAltRes = await axios.post(
           'https://checkout.korapay.com/validate-link',
           { slug: args.orderId, env: 'live' },
-          { headers: authenticatedHeaders, timeout: 15000 }
+          { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
 
         const verifyData = verifyAltRes.data
@@ -552,18 +553,18 @@ CRITICAL: Match actions meticulously. Keep lines down to casual 1-2 sentence fra
 }
 
 async function synthesizeResponse(toolResult, businessName, userMessage, history) {
-  // Catch system fallback/retry indicators and tell the user directly to wait a brief second instead of generating fake account text.
-  if (toolResult.includes('SYSTEM_BUSY_RETRY')) {
-    return "Hold on a second, boss. Let me refresh the network line to generate your bank transfer credentials real quick."
+  // If the API call fails or returns dummy/empty values, we override the AI response completely
+  if (toolResult.includes('KORA_API_FETCH_FAILED')) {
+    return "Hold on a second, boss. The network line to generate your bank transfer details is loading, let me re-trigger it real quick."
   }
 
   const customPrompt = `You are a native Nigerian individual running sales operations on WhatsApp for ${businessName}.
-Transform the raw system data payload directly into a short, natural, conversational human text response.
+Transform the raw data payload directly into a short, natural, conversational human text message response.
 
 RULES:
 1. MAX 1-2 short casual sentences. Do not spam words.
-2. ABSOLUTELY NO BOLD MARKDOWN ASTERISKS (**). Keep text completely flat and clean.
-3. Inform them directly of the exact bank name and dynamic bank account number found in the system data summary so they can perform the transfer instantly.
+2. ABSOLUTELY NO BOLD MARKDOWN ASTERISKS (**). Keep text flat and clear.
+3. Inform them directly of the account number and bank name generated from the system data summary so they can perform the transfer instantly.
 
 RAW SYSTEM DATA SUMMARY:
 ${toolResult}
@@ -645,7 +646,16 @@ app.post('/webhook', async (req, res) => {
 
     let definitiveReply
 
-    if (routingDecision.type === 'tool_call') {
+    if (routingDecision.type === 'tool_call' && routingDecision.tool.function.name === 'initiatePayment') {
+      // Step 1: Send the immediate intermediate message to the customer right away before running the api wait line
+      const loadingPhrase = "Hold on na, make I get your account transfer details sharp sharp..."
+      await sendReplyViaGateway(userId, normalizedFrom, loadingPhrase)
+      await saveMessage(userId, phoneNumber, 'assistant', loadingPhrase, `ai_load_${Date.now()}`)
+
+      // Step 2: Now synchronously execute the 4-step chain block
+      const internalExecution = await executeTool(routingDecision.tool, userId, phoneNumber, storeContext.products, convContext)
+      definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
+    } else if (routingDecision.type === 'tool_call') {
       const internalExecution = await executeTool(routingDecision.tool, userId, phoneNumber, storeContext.products, convContext)
       definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
     } else {
@@ -696,8 +706,7 @@ app.post('/korapay-webhook', async (req, res) => {
           {
             headers: {
               'accept': 'application/json',
-              'content-type': 'application/json',
-              'Authorization': `Bearer ${KORAPAY_SECRET_KEY}`
+              'content-type': 'application/json'
             },
             timeout: 15000
           }
