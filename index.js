@@ -22,9 +22,7 @@ const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'google/gemini-2.0-flash-exp'
 const PORT = process.env.PORT || 3000
 
-const KORA_SECRET_KEY = process.env.KORA_SECRET_KEY
-const PRODUCT_A_WEBHOOK = process.env.PRODUCT_A_WEBHOOK_URL
-const PRODUCT_B_WEBHOOK = process.env.PRODUCT_B_WEBHOOK_URL
+const KORAPAY_SECRET_KEY = process.env.KORAPAY_SECRET_KEY || process.env.KORA_SECRET_KEY || ''
 
 // ========================
 // FIREBASE INITIALIZATION
@@ -62,7 +60,6 @@ async function getOrCreateConversationContext(businessId, phoneNumber) {
     const doc = await docRef.get()
     if (doc.exists) {
       const data = doc.data()
-      // If data is older than 45 minutes, clear negotiation round to prevent stale loop traps
       if (Date.now() - (data.lastInteraction || 0) > 2700000) {
         return {
           currentProduct: null,
@@ -113,17 +110,10 @@ async function getConversationHistory(businessId, phoneNumber, limit = 15) {
       .get()
 
     const messages = snapshot.docs.map((doc) => doc.data()).reverse()
-    const userMessages = messages.filter(m => m.role === 'user')
-    const negotiationCount = messages.filter(m => m.text && (m.text.toLowerCase().includes('k') || m.text.toLowerCase().includes('000'))).length
-
-    return {
-      messages,
-      count: messages.length,
-      isPriceSensitive: negotiationCount > 3
-    }
+    return { messages, count: messages.length }
   } catch (err) {
     console.error('[DB] History fetch error:', err.message)
-    return { messages: [], count: 0, isPriceSensitive: false }
+    return { messages: [], count: 0 }
   }
 }
 
@@ -203,7 +193,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'makeCounterOffer',
-      description: 'Call this ONLY when a customer requests a cheaper price or presents a lower counter offer counter budget. The backend handles strategy calculations.',
+      description: 'Call this ONLY when a customer requests a cheaper price or presents a lower counter offer counter budget.',
       parameters: {
         type: 'object',
         properties: {
@@ -223,8 +213,7 @@ const AI_TOOLS = [
         type: 'object',
         properties: {
           productName: { type: 'string', description: 'The product being bought' },
-          agreedPrice: { type: 'number', description: 'The dynamic finalized transaction value' },
-          customerName: { type: 'string', description: 'Known client name or leave empty' }
+          agreedPrice: { type: 'number', description: 'The dynamic finalized transaction value' }
         },
         required: ['productName', 'agreedPrice']
       },
@@ -234,7 +223,7 @@ const AI_TOOLS = [
     type: 'function',
     function: {
       name: 'checkOrderStatus',
-      description: 'Verify payment or tracking records.',
+      description: 'Verify payment or tracking records using the tracking reference ID.',
       parameters: {
         type: 'object',
         properties: { orderId: { type: 'string' } },
@@ -281,15 +270,12 @@ function findBestProductMatch(query, products) {
   return highestScore > 0.4 ? bestMatch : null
 }
 
-// ========================
-// RE-ENGINEERED NEGOTIATION MATRIX
-// ========================
 function calculateCounterOffer(customerOffer, listPrice, floorPrice, round) {
   if (customerOffer >= floorPrice) {
     return {
       price: customerOffer,
       strategy: 'accept',
-      message: 'Deal locked! Let me get your invoice'
+      message: 'Deal locked! Let me get your link setup'
     }
   }
 
@@ -324,7 +310,7 @@ function calculateCounterOffer(customerOffer, listPrice, floorPrice, round) {
 }
 
 // ========================
-// HARDENED TOOL EXECUTION
+// DIRECT KORAPAY HOOKS HANDLERS
 // ========================
 async function executeTool(toolCall, businessId, phoneNumber, products = [], convContext) {
   const { name, arguments: argsStr } = toolCall.function
@@ -335,7 +321,19 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     console.error('[TOOL PARSE FAILURE]:', e.message)
   }
 
-  console.log(`[EXECUTING SERVICE LAYER]: 🔧 ${name}`)
+  // Shared precise headers used inside your checkout engine flow
+  const korapayHeaders = {
+    'accept': 'application/json',
+    'accept-language': 'en-US,en;q=0.9',
+    'content-type': 'application/json',
+    'priority': 'u=1, i',
+    'sec-ch-ua': '"Microsoft Edge";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin'
+  }
 
   switch (name) {
     case 'getProductList': {
@@ -385,50 +383,69 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         convContext.intent = 'buying'
         convContext.lastPrice = checkAmount
 
-        const koraResponse = await axios.post(
-          `https://api.korapay.com/v1/charges/bank-transfer`,
+        console.log(`📡 [DIRECT-KORAPAY] Initializing payment-link for reference: ${reference}`);
+        
+        // Directly executing action === 'create-payment' configuration pipeline 
+        const response = await axios.post(
+          'https://checkout.korapay.com/?type=payment-link',
           {
-            amount: checkAmount,
             reference: reference,
-            currency: 'NGN',
-            notification_url: 'https://aromsg.up.railway.app/korapay-webhook',
-            customer: { name: 'WhatsApp Buyer', email: `${phoneNumber}@aromsg.app` },
-            merchant_bears_cost: false
+            amount: checkAmount,
+            currency: "NGN",
+            customer: {
+              name: "WhatsApp Client",
+              email: `${phoneNumber}@aromsg.app`
+            },
+            notification_url: "https://lit-proxy.vercel.app/api/proxy?provider=kora",
+            redirect_url: "https://checkout.korapay.com"
           },
-          { headers: { 'Authorization': `Bearer ${KORA_SECRET_KEY}` }, timeout: 15000 }
+          { headers: korapayHeaders, timeout: 15000 }
         )
 
-        const payload = koraResponse.data
-        if (payload?.status === true && payload.data?.bank_account_number) {
-          const wire = payload.data
-          await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
-            reference,
-            phoneNumber: phoneNumber.replace(/\D/g, ''),
-            amount: checkAmount,
-            product: tag,
-            status: 'pending',
-            createdAt: Date.now()
-          })
+        // Store tracking document inside local collection references safely
+        await db.collection('businesses').doc(businessId).collection('orders').doc(reference).set({
+          reference,
+          phoneNumber: phoneNumber.replace(/\D/g, ''),
+          amount: checkAmount,
+          product: tag,
+          status: 'pending',
+          createdAt: Date.now()
+        })
 
-          return `RESULT:KORA_DYNAMIC_WIRE\nBank: ${wire.bank_name}\nAccountNumber: ${wire.bank_account_number}\nAccountName: ${wire.account_name}\nAmount: ₦${checkAmount.toLocaleString()}\nReference: ${reference}`
-        }
-        return 'RESULT: Dynamic channels unaligned. Try again.'
+        return `RESULT:KORAPAY_LINK_GENERATION\nAmount: ₦${checkAmount.toLocaleString()}\nReference: ${reference}\nCheckoutURL: ${response.data?.data?.checkout_url || ''}`
+        
       } catch (err) {
-        console.error('[KORAPAY CRITICAL]:', err.response?.data || err.message)
-        return 'RESULT: Payment interface unreachable.'
+        console.error('❌ [DIRECT-KORAPAY] Failed to execute payment registration:', err.response?.data || err.message)
+        return 'RESULT: Outbound checkout routing system busy. Please try again.'
       }
     }
 
     case 'checkOrderStatus': {
       try {
-        const snap = await db.collectionGroup('orders').where('reference', '==', args.orderId).limit(1).get()
-        if (!snap.empty) {
-          const match = snap.docs[0].data()
-          return `RESULT:INVOICE_STATUS\nStatus: ${match.status}\nItem: ${match.product}\nSum: ₦${match.amount?.toLocaleString()}`
+        console.log(`🔍 [DIRECT-VERIFY] Running check status verification loop for reference: ${args.orderId}`);
+        
+        // Directly executing action === 'verify-payment' alternative flow configuration
+        const verifyAltRes = await axios.post(
+          'https://checkout.korapay.com/validate-link',
+          {
+            slug: args.orderId,
+            env: 'live'
+          },
+          { headers: korapayHeaders, timeout: 15000 }
+        )
+
+        const verifyData = verifyAltRes.data
+        const isPaymentSuccessful = verifyData.success && 
+          (verifyData.data?.data?.status === 'success' || 
+           verifyData.data?.data?.payment_status === 'success' ||
+           verifyData.data?.status === true)
+
+        if (isPaymentSuccessful) {
+          return `RESULT:INVOICE_STATUS\nStatus: confirmed\nReference: ${args.orderId}`
         }
-        return 'RESULT: Invoice trace not found.'
+        return `RESULT:INVOICE_STATUS\nStatus: pending_confirmation\nReference: ${args.orderId}`
       } catch (e) {
-        return 'RESULT: Query route error.'
+        return 'RESULT: Query route verification timed out.'
       }
     }
     default:
@@ -480,21 +497,21 @@ CRITICAL: Match actions meticulously. Keep lines down to casual 1-2 sentence fra
     if (choice.tool_calls?.length > 0) {
       return { type: 'tool_call', tool: choice.tool_calls[0] }
     }
-    return { type: 'text', content: choice.content?.trim() || 'I look you, give me one sec' }
+    return { type: 'text', content: choice.content?.trim() || 'One sec let me look into that.' }
   } catch (err) {
     console.error('[CORE REASONING LOOP ERROR]:', err.message)
-    return { type: 'text', content: 'Deji, let me confirm something sharp.' }
+    return { type: 'text', content: 'Let me confirm that for you real quick.' }
   }
 }
 
 async function synthesizeResponse(toolResult, businessName, userMessage, history) {
   const customPrompt = `You are a native Nigerian individual running sales operations on WhatsApp for ${businessName}.
-Transform the raw data context block into an extremely clean, organic, human text response.
+Transform the raw systems response block into a short, natural, conversational human text message response.
 
 RULES:
-1. MAX 1-2 short casual conversational sentences.
-2. ABSOLUTELY NO BOLD MARKDOWN ASTERISKS (**). Keep things clean and flat.
-3. If the data details bank accounts (KORA_DYNAMIC_WIRE), write out the Bank Name, Account Number, and Account Name plainly on split clean clear lines so they can copy-paste easily.
+1. MAX 1-2 short casual sentences. Do not spam words.
+2. ABSOLUTELY NO BOLD MARKDOWN ASTERISKS (**). Keep text flat and clear.
+3. Inform them smoothly that their safe payment checkout setup is verified, processed, and locked in.
 
 RAW SYSTEM DATA SUMMARY:
 ${toolResult}
@@ -552,7 +569,7 @@ async function sendReplyViaGateway(userId, jid, text) {
 }
 
 // ========================
-// WEBHOOK ROUTERS
+// MAIN WEBHOOK ENTRY
 // ========================
 app.post('/webhook', async (req, res) => {
   try {
@@ -569,7 +586,6 @@ app.post('/webhook', async (req, res) => {
     const storeContext = await getBusinessContext(userId)
     if (!storeContext) return res.status(404).json({ error: 'Store missed' })
 
-    // Load persistent state context directly from FireStore
     const convContext = await getOrCreateConversationContext(userId, phoneNumber)
     const structuralHistory = await getConversationHistory(userId, phoneNumber)
 
@@ -584,16 +600,14 @@ app.post('/webhook', async (req, res) => {
       definitiveReply = routingDecision.content
     }
 
-    // Sanitize technical leak strings
     definitiveReply = definitiveReply
       .replace(/```json|```/gi, '')
-      .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|KORA_DYNAMIC_WIRE/gi, '')
+      .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|KORAPAY_LINK_GENERATION/gi, '')
       .trim()
 
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', definitiveReply, `ai_${Date.now()}`)
     
-    // Core state save back to FireStore database
     await saveConversationContext(userId, phoneNumber, convContext)
     await sendReplyViaGateway(userId, normalizedFrom, definitiveReply)
 
@@ -604,43 +618,97 @@ app.post('/webhook', async (req, res) => {
   }
 })
 
-// ========================
-// KORAPAY WEBHOOK VERIFICATION
-// ========================
-function verifyKoraSignature(body, signature) {
-  if (!signature || !KORA_SECRET_KEY) return false
-  try {
-    const payloadString = JSON.stringify(body.data)
-    const hash = crypto.createHmac('sha256', KORA_SECRET_KEY).update(payloadString).digest('hex')
-    return crypto.timingSafeEqual(Buffer.from(hash), Buffer.from(signature))
-  } catch {
-    return false
-  }
-}
-
+// ============================================================================
+// 🪝 LISTENER FOR WEBHOOKS DISPATCHED BY YOUR MULTIPLEXER ROUTER
+// ============================================================================
 app.post('/korapay-webhook', async (req, res) => {
-  const signature = req.headers['x-korapay-signature']
   const body = req.body
 
-  if (!verifyKoraSignature(body, signature)) return res.status(200).json({ received: true })
-  res.status(200).json({ received: true })
+  console.log('📦 Inbound forward payload from router multiplexer captured.');
+  
+  // Instantly return 200 so your router code handles execution flawlessly
+  res.status(200).json({ success: true, message: "Webhook payload cached directly by AI system" })
 
   setImmediate(async () => {
     const data = body.data || {}
-    const reference = data.reference || data.payment_reference || ''
-    if (reference.startsWith('REF-') && body.event === 'charge.success') {
+    const reference = data.reference || ''
+    const bankDetails = data.counter_party || {}
+    const accountNumber = bankDetails.account_number || 'N/A'
+    const bankName = bankDetails.bank_name || 'Transfer'
+
+    if (body.event === 'charge.success' && data.status === 'success') {
       try {
+        console.log(`🔍 [DIRECT-VERIFY] Checking double-verification checkout link status for reference: ${reference}`)
+        
+        // Directly running alternative verification action validation block layout
+        const verifyAltRes = await axios.post(
+          'https://checkout.korapay.com/validate-link',
+          {
+            slug: reference,
+            env: 'live'
+          },
+          {
+            headers: {
+              'accept': 'application/json',
+              'content-type': 'application/json'
+            },
+            timeout: 15000
+          }
+        )
+
+        const verifyData = verifyAltRes.data
+        const isPaymentSuccessful = verifyData.success && 
+          (verifyData.data?.data?.status === 'success' || 
+           verifyData.data?.data?.payment_status === 'success' ||
+           verifyData.data?.status === true)
+
+        if (!isPaymentSuccessful) {
+          console.warn(`⚠️ [VERIFY-PAYMENT FAILED] Verification failed on direct check for reference: ${reference}`)
+          return
+        }
+
+        // Query across multiple business directories setup
         const snapshot = await db.collectionGroup('orders').where('reference', '==', reference).limit(1).get()
         if (!snapshot.empty) {
           const docTarget = snapshot.docs[0]
           const orderData = docTarget.data()
-          await docTarget.ref.update({ status: 'success', paidAt: Date.now() })
+          
+          // Force tracking updates to database state records
+          await docTarget.ref.update({ 
+            status: 'success', 
+            paidAt: Date.now(),
+            accountVerified: accountNumber
+          })
 
-          const summaryAlert = `✅ *Payment Confirmed!* \n\nReceived payment for: ${orderData.product}\nValue: ₦${orderData.amount.toLocaleString()}\n\nProcessing order details immediately! 🚀`
-          await sendReplyViaGateway(docTarget.ref.parent.parent.id, `${orderData.phoneNumber}@s.whatsapp.net`, summaryAlert)
+          // Clear conversational pipeline records
+          const cleanPhone = orderData.phoneNumber
+          const businessId = docTarget.ref.parent.parent.id
+          await db.collection('businesses').doc(businessId).collection('contexts').doc(cleanPhone).update({
+            currentProduct: null,
+            lastPrice: null,
+            negotiationRound: 0,
+            intent: 'browsing'
+          })
+
+          // Generate dynamic human layout receipt template
+          const receiptAlert = `🧾 *TRANSACTION RECEIPT*
+----------------------------------------
+🛍️ *Product:* ${orderData.product}
+💰 *Amount Paid:* ₦${orderData.amount.toLocaleString()}
+🆔 *Reference:* ${reference}
+🏦 *Paid Via:* ${bankName} (${accountNumber})
+📅 *Status:* Payment Confirmed Successfully
+
+Thank you for your patronage! Your order is being processed sharp sharp. 🚀`
+
+          // Dispatch transactional alert back to the client via WhatsApp automation gateway
+          await sendReplyViaGateway(businessId, `${cleanPhone}@s.whatsapp.net`, receiptAlert)
+          console.log(`✅ [RECEIPT DISPATCHED]: Directly confirmed status and sent receipt for reference ${reference}`)
+        } else {
+          console.error(`❌ [FIRESTORE MISS]: Order tracking document missing inside DB collections for reference: ${reference}`)
         }
       } catch (e) {
-        console.error('[KORA MATCH FAIL]:', e.message)
+        console.error('[WEBHOOK ASYNC PROCESSING FAULT]:', e.response?.data || e.message)
       }
     }
   })
@@ -648,6 +716,6 @@ app.post('/korapay-webhook', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ status: 'online', memory: process.memoryUsage().heapUsed / 1024 / 1024 }))
 
-app.listen(PORT, () => console.log(`🚀 Production Architecture Scaled On Port ${PORT}`))
+app.listen(PORT, () => console.log(`🚀 Production Architecture Running Direct Inline Hooks On Port ${PORT}`))
 
 module.exports = app
