@@ -1,3 +1,4 @@
+
 const express = require('express')
 const dotenv = require('dotenv')
 const axios = require('axios')
@@ -324,7 +325,6 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     console.error('[TOOL PARSE FAILURE]:', e.message)
   }
 
-  // Exact configuration headers matching your template traces directly
   const nativeCheckoutHeaders = {
     'accept': 'application/json',
     'accept-language': 'en-US,en;q=0.9',
@@ -337,6 +337,10 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
     'sec-fetch-mode': 'cors',
     'sec-fetch-site': 'same-origin'
   }
+
+  // Sanitize phone number safely to avoid any double @ symbols in the email!
+  const cleanPhone = phoneNumber.replace(/\D/g, '')
+  const sanitizedEmail = `${cleanPhone}@cloutivaapp.shop`
 
   switch (name) {
     case 'getProductList': {
@@ -377,8 +381,8 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
 
     case 'initiatePayment': {
       try {
-        const dynamicSlug = "ovgtc2b4JUo4hEa" // Using your validated template active storefront token
-        const checkAmount = parseFloat(args.agreedPrice) || 0
+        const dynamicSlug = "ovgtc2b4JUo4hEa" // System template token
+        const checkAmount = Math.round(parseFloat(args.agreedPrice) || 0)
         const tag = args.productName || 'Inventory Order'
 
         if (checkAmount <= 0) return 'RESULT: Invalid pricing parameters.'
@@ -387,10 +391,10 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
         convContext.lastPrice = checkAmount
 
         // --------------------------------------------------------------------
-        // 📡 STEP 1: VALIDATE LINK (Resolves the baseline transaction specifications)
+        // 📡 STEP 1: VALIDATE LINK (Gets reference & key)
         // --------------------------------------------------------------------
         const step1Payload = { slug: dynamicSlug, env: 'live' }
-        console.log(`📡 [STEP 1: VALIDATE-LINK] URL: https://checkout.korapay.com/validate-link`, JSON.stringify(step1Payload));
+        console.log(`📡 [STEP 1: VALIDATE-LINK] URL: https://checkout.korapay.com/validate-link Payload:`, JSON.stringify(step1Payload));
         
         const validateRes = await axios.post(
           'https://checkout.korapay.com/validate-link',
@@ -398,16 +402,20 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
         
-        const solvedRequestRef = validateRes.data?.data?.data?.reference || "KPY-PAY-REQ-g4z3vqwhnLHspIf"
+        const retrievedData = validateRes.data?.data?.data || {}
+        const solvedRequestRef = retrievedData.reference || "KPY-PAY-REQ-g4z3vqwhnLHspIf"
+        const activePublicKey = retrievedData.public_key || KORAPAY_PUBLIC_KEY
+
+        console.log(`✅ [STEP 1 SUCCESS] Reference: ${solvedRequestRef} | Public Key: ${activePublicKey}`);
 
         // --------------------------------------------------------------------
-        // 📡 STEP 2: CREATE CHARGE OVER PAYMENT LINK (Acquires tracking token)
+        // 📡 STEP 2: CREATE CHARGE OVER PAYMENT LINK
         // --------------------------------------------------------------------
         const step2Payload = {
           data: {
             customer: {
               name: "WhatsApp Client",
-              email: `${phoneNumber}@Aromsg.net`
+              email: sanitizedEmail // Perfect sanitized format!
             },
             amount: String(checkAmount),
             currency: "NGN",
@@ -415,9 +423,9 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
               reference: solvedRequestRef
             }
           },
-          public_key: KORAPAY_PUBLIC_KEY
+          public_key: activePublicKey
         }
-        console.log(`📡 [STEP 2: CREATE-PAYMENT] URL: https://checkout.korapay.com/?type=payment-link`, JSON.stringify(step2Payload));
+        console.log(`📡 [STEP 2: CREATE-PAYMENT] URL: https://checkout.korapay.com/?type=payment-link Payload:`, JSON.stringify(step2Payload));
 
         const createRes = await axios.post(
           'https://checkout.korapay.com/?type=payment-link',
@@ -425,24 +433,27 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
 
-        const solvedPaymentReference = createRes.data?.data?.payment_reference || createRes.data?.data?.data?.payment_reference
+        const payloadData = createRes.data?.data?.data || createRes.data?.data || {}
+        const solvedPaymentReference = payloadData.payment_reference
 
         if (!solvedPaymentReference) {
-          console.error('❌ Missing payment_reference token output configuration from Kora runtime response block');
+          console.error('❌ Missing payment_reference token from Step 2 response. Full Response:', JSON.stringify(createRes.data));
           return `RESULT:KORA_API_FETCH_FAILED`
         }
 
+        console.log(`✅ [STEP 2 SUCCESS] Payment Reference Obtained: ${solvedPaymentReference}`);
+
         // --------------------------------------------------------------------
-        // 📡 STEP 3: BANK CHARGE (Produces dedicated dynamic bank account data)
+        // 📡 STEP 3: BANK CHARGE (Resolves direct Sterling Bank transfers details)
         // --------------------------------------------------------------------
         const step3Payload = {
           type: "bank_transfer",
           data: {
-            public_key: KORAPAY_PUBLIC_KEY,
+            public_key: activePublicKey,
             payment_reference: solvedPaymentReference
           }
         }
-        console.log(`📡 [STEP 3: BANK-CHARGE] URL: https://checkout.korapay.com/bank/charge`, JSON.stringify(step3Payload));
+        console.log(`📡 [STEP 3: BANK-CHARGE] URL: https://checkout.korapay.com/bank/charge Payload:`, JSON.stringify(step3Payload));
 
         const bankChargeRes = await axios.post(
           'https://checkout.korapay.com/bank/charge',
@@ -450,23 +461,25 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           { headers: nativeCheckoutHeaders, timeout: 15000 }
         )
 
-        const extractedBody = bankChargeRes.data?.data?.data || bankChargeRes.data?.data || {}
-        const bankDetails = extractedBody.bank_details || extractedBody.bank_account || {}
+        const chargePayload = bankChargeRes.data?.data?.data || bankChargeRes.data?.data || {}
+        const bankDetails = chargePayload.bank_details || chargePayload.bank_account || {}
         
         const dynamicAccountNumber = bankDetails.account_number
         const dynamicBankName = bankDetails.bank_name
-        const internalReferenceId = extractedBody.reference || solvedPaymentReference
+        const finalExpectedAmount = parseFloat(chargePayload.amount_expected || chargePayload.amount || checkAmount)
 
         if (!dynamicAccountNumber || dynamicAccountNumber === '0000000000') {
-          console.warn(`⚠️ Dynamic bank parameters generated empty tokens.`);
+          console.error(`⚠️ Empty or mock account details returned in Step 3. Response:`, JSON.stringify(bankChargeRes.data));
           return `RESULT:KORA_API_FETCH_FAILED`
         }
 
-        // Save order payload into database tracking references
-        await db.collection('businesses').doc(businessId).collection('orders').doc(internalReferenceId).set({
-          reference: internalReferenceId,
-          phoneNumber: phoneNumber.replace(/\D/g, ''),
-          amount: checkAmount,
+        console.log(`✅ [STEP 3 SUCCESS] Account: ${dynamicAccountNumber} | Bank: ${dynamicBankName} | Expecting: ₦${finalExpectedAmount}`);
+
+        // Save order configuration details to database collections
+        await db.collection('businesses').doc(businessId).collection('orders').doc(solvedPaymentReference).set({
+          reference: solvedPaymentReference,
+          phoneNumber: cleanPhone,
+          amount: finalExpectedAmount,
           product: tag,
           status: 'pending',
           createdAt: Date.now(),
@@ -474,10 +487,10 @@ async function executeTool(toolCall, businessId, phoneNumber, products = [], con
           generatedBank: dynamicBankName
         })
 
-        return `RESULT:BANK_TRANSFER_PAYLOAD_GENERATION\nAmount: ₦${checkAmount.toLocaleString()}\nReference: ${internalReferenceId}\nBankAccountNumber: ${dynamicAccountNumber}\nBankName: ${dynamicBankName}`
+        return `RESULT:BANK_TRANSFER_PAYLOAD_GENERATION\nAmount: ₦${finalExpectedAmount.toLocaleString()}\nReference: ${solvedPaymentReference}\nBankAccountNumber: ${dynamicAccountNumber}\nBankName: ${dynamicBankName}`
         
       } catch (err) {
-        console.error('❌ [INTERNAL EXECUTOR CHAIN CRITICAL FAULT]:', err.response?.data || err.message)
+        console.error('❌ [INTERNAL PIPELINE EXECUTOR FAILURE]:', err.response?.data || err.message)
         return `RESULT:KORA_API_FETCH_FAILED`
       }
     }
@@ -563,7 +576,6 @@ CRITICAL: Match actions meticulously. Keep lines down to casual 1-2 sentence fra
 }
 
 async function synthesizeResponse(toolResult, businessName, userMessage, history) {
-  // If the API call fails or returns dummy/empty values, we override the AI response completely
   if (toolResult.includes('KORA_API_FETCH_FAILED')) {
     return "Hold on a second, boss. The network line to generate your bank transfer details is loading, let me re-trigger it real quick."
   }
@@ -657,12 +669,12 @@ app.post('/webhook', async (req, res) => {
     let definitiveReply
 
     if (routingDecision.type === 'tool_call' && routingDecision.tool.function.name === 'initiatePayment') {
-      // Step 1: Send the immediate intermediate message to the customer right away before running the api wait line
+      // Step 1: Send immediate load acknowledgement to avoid WhatsApp gateways timing out while API waits
       const loadingPhrase = "Hold on na, make I get your account transfer details sharp sharp..."
       await sendReplyViaGateway(userId, normalizedFrom, loadingPhrase)
       await saveMessage(userId, phoneNumber, 'assistant', loadingPhrase, `ai_load_${Date.now()}`)
 
-      // Step 2: Now synchronously execute the 4-step chain block
+      // Step 2: Now synchronously execute the 3-step checkout generation
       const internalExecution = await executeTool(routingDecision.tool, userId, phoneNumber, storeContext.products, convContext)
       definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
     } else if (routingDecision.type === 'tool_call') {
@@ -673,11 +685,9 @@ app.post('/webhook', async (req, res) => {
     }
 
     definitiveReply = definitiveReply
-  .replace(/```json|```/gi, '')
-  // Escaped forward slashes inside the regex pattern cleanly:
-  .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|BANK_TRANSFER_PAYLOAD_GENERATION/gi, '')
-  .trim()
-
+      .replace(/```json|```/gi, '')
+      .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|BANK_TRANSFER_PAYLOAD_GENERATION/gi, '')
+      .trim()
 
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', definitiveReply, `ai_${Date.now()}`)
@@ -780,3 +790,5 @@ app.get('/health', (req, res) => res.json({ status: 'online', memory: process.me
 app.listen(PORT, () => console.log(`🚀 Dedicated Production Engine Running Inline 4-Step Hook Arrays On Port ${PORT}`))
 
 module.exports = app
+
+
