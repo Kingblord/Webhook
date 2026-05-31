@@ -673,10 +673,11 @@ app.post('/webhook', async (req, res) => {
     }
 
     definitiveReply = definitiveReply
-      .replace(/```json|
-```/gi, '')
-      .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|BANK_TRANSFER_PAYLOAD_GENERATION/gi, '')
-      .trim()
+  .replace(/```json|```/gi, '')
+  // Escaped forward slashes inside the regex pattern cleanly:
+  .replace(/RESULT:|PRODUCT_LIST:|PAYMENT_DETAILS:|BANK_TRANSFER_PAYLOAD_GENERATION/gi, '')
+  .trim()
+
 
     await saveMessage(userId, phoneNumber, 'user', text, messageId || `in_${Date.now()}`)
     await saveMessage(userId, phoneNumber, 'assistant', definitiveReply, `ai_${Date.now()}`)
