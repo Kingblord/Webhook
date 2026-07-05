@@ -1450,6 +1450,7 @@ async function processInactivityCleanup(businessId) {
 
     const batch = db.batch()
     let count = 0
+    const abandonedRefs = []
 
     contextSnap.forEach((doc) => {
       const data = doc.data()
@@ -1461,13 +1462,7 @@ async function processInactivityCleanup(businessId) {
           db.doc(`businesses/${businessId}/orders/${data.currentOrderReference}`),
           { status: 'ABANDONED', closedAt: Date.now() }
         )
-        // Mirror to flat collection
-        try {
-          await db.collection('orders').doc(data.currentOrderReference).update({
-            status: 'cancelled',
-            closedAt: Date.now()
-          })
-        } catch (e) { /* flat doc may not exist */ }
+        abandonedRefs.push(data.currentOrderReference)
       }
       batch.delete(doc.ref)
       count++
@@ -1475,6 +1470,15 @@ async function processInactivityCleanup(businessId) {
 
     if (count > 0) {
       await batch.commit()
+      // Mirror abandoned status to flat orders collection (after batch commit)
+      for (const ref of abandonedRefs) {
+        try {
+          await db.collection('orders').doc(ref).update({
+            status: 'cancelled',
+            closedAt: Date.now()
+          })
+        } catch (e) { /* flat doc may not exist */ }
+      }
       console.log(`🧹 Cleaned ${count} stale contexts for business ${businessId}`)
     }
     return { cleaned: count }
