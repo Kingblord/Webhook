@@ -1240,29 +1240,36 @@ app.post('/webhook', async (req, res) => {
       }
     } else if (routingDecision.type === 'tool_call') {
       internalExecution = await executeTool(routingDecision.tool, userId, phoneNumber, storeContext.products, convContext)
-      definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
 
       // ─── Send product image if getProductInfo was called and has image ───
+      let productImageUrl = ''
       if (routingDecision.tool.function.name === 'getProductInfo' && internalExecution && internalExecution.includes('ImageUrl:')) {
         const imgMatch = internalExecution.match(/ImageUrl: (.+)/)
-        const productImageUrl = imgMatch ? imgMatch[1].trim() : ''
-        if (productImageUrl && productImageUrl.startsWith('http')) {
-          setImmediate(async () => {
-            try {
-              await axios.post(`${GATEWAY_URL}/send-media`, {
-                userId,
-                to: normalizedFrom,
-                mediaUrl: productImageUrl,
-                caption: `Here is the ${convContext.currentProduct || 'product'} 📸`
-              }, {
-                headers: { Authorization: `Bearer ${INTERNAL_API_KEY}` },
-                timeout: 15000
-              })
-            } catch (imgErr) {
-              console.error('[PRODUCT IMAGE SEND ERROR]:', imgErr.message)
-            }
-          })
-        }
+        productImageUrl = imgMatch ? imgMatch[1].trim() : ''
+        // Strip ImageUrl from the data sent to synthesizer so AI doesn't print the URL
+        internalExecution = internalExecution.replace(/\nImageUrl: .*/, '')
+      }
+
+      definitiveReply = await synthesizeResponse(internalExecution, storeContext.businessName, text, structuralHistory.messages)
+
+      // Send product image media asynchronously
+      if (productImageUrl && productImageUrl.startsWith('http')) {
+        setImmediate(async () => {
+          try {
+            await axios.post(`${GATEWAY_URL}/send-media`, {
+              userId,
+              to: normalizedFrom,
+              mediaUrl: productImageUrl,
+              caption: `Here is the ${convContext.currentProduct || 'product'} 📸`
+            }, {
+              headers: { Authorization: `Bearer ${INTERNAL_API_KEY}` },
+              timeout: 15000
+            })
+            console.log(`📸 Product image sent for ${convContext.currentProduct}`)
+          } catch (imgErr) {
+            console.error('[PRODUCT IMAGE SEND ERROR]:', imgErr.message)
+          }
+        })
       }
     } else {
       definitiveReply = routingDecision.content
